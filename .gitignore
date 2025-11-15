@@ -1,0 +1,40 @@
+# === Build directories ===
+build/
+cmake-build*/
+out/
+bin/
+lib/
+
+# Ninja / CMake artifacts
+*.ninja
+*.sln
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+compile_commands.json
+
+# Generated headers / tables
+*.inc
+*.td.out
+*.gen.cpp
+*.gen.h
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS/platform junk
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Backup files
+*~
+*.bak
+*.orig
