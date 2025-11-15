@@ -3,7 +3,6 @@ build/
 cmake-build*/
 out/
 bin/
-lib/
 
 # Ninja / CMake artifacts
 *.ninja
