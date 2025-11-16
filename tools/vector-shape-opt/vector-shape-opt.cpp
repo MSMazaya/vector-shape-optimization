@@ -7,6 +7,8 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 
 #include "my/Passes.h"
 
@@ -21,10 +23,16 @@ int main(int argc, char **argv) {
       tensor::TensorDialect,
       scf::SCFDialect,
       arith::ArithDialect,
-      math::MathDialect>();
+      math::MathDialect,
+      vector::VectorDialect,
+      memref::MemRefDialect>();
 
   registerPass([]() -> std::unique_ptr<Pass> {
     return createPrintLinalgOpsPass();
+  });
+
+  registerPass([]() -> std::unique_ptr<Pass> {
+    return createLinalgToVectorPass();
   });
 
   return failed(MlirOptMain(argc, argv,

@@ -6,6 +6,7 @@
 
 namespace mlir {
 std::unique_ptr<Pass> createPrintLinalgOpsPass();
+std::unique_ptr<Pass> createLinalgToVectorPass();
 }
 
 #endif
