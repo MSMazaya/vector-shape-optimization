@@ -60,6 +60,10 @@ struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
     int64_t m = resultType.getDimSize(0);
     int64_t n = resultType.getDimSize(1);
     int64_t kDim = lhsType.getDimSize(1);
+    
+    // Check if dimensions are static and if there's a remainder at compile time
+    bool hasStaticDims = !resultType.isDynamicDim(0) && !resultType.isDynamicDim(1);
+    bool hasRemainderAtCompileTime = hasStaticDims && (n % vectorLen != 0);
 
     // Create constants
     auto zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
@@ -75,15 +79,20 @@ struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
     rewriter.setInsertionPointToStart(outerLoopI.getBody());
     auto i = outerLoopI.getInductionVar();
 
+    // Calculate how many full vectors we can process
+    // Process full vectors first, then handle remainder separately
+    auto nDivVectorLen = rewriter.create<arith::DivUIOp>(loc, nConst, vectorLenConst);
+    auto fullVectorCount = rewriter.create<arith::MulIOp>(loc, nDivVectorLen, vectorLenConst);
+    
     // Loop for j with vector stride (columns processed in chunks of vectorLen)
-    auto jLoop = rewriter.create<scf::ForOp>(loc, zero, nConst, vectorLenConst);
+    // Only iterate over full vectors to avoid out-of-bounds access
+    auto jLoop = rewriter.create<scf::ForOp>(loc, zero, fullVectorCount, vectorLenConst);
     rewriter.setInsertionPointToStart(jLoop.getBody());
     auto jBase = jLoop.getInductionVar();
 
-    // Initialize accumulator vector with zeros (inside j loop)
+    // Initialize accumulator vector with zeros
     auto zeroElement = rewriter.create<arith::ConstantOp>(
         loc, elementType, rewriter.getZeroAttr(elementType));
-    // Create a broadcast/splat operation to initialize vector with zero
     auto accInit = rewriter.create<vector::BroadcastOp>(loc, vectorType, zeroElement);
 
     // Inner loop for k dimension (reduction dimension) with accumulator
@@ -93,15 +102,14 @@ struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
         loc, zero, kConst, one, initArgs);
     rewriter.setInsertionPointToStart(innerLoopK.getBody());
     auto k = innerLoopK.getInductionVar();
-    // The accumulator is the first iter arg (arg 0 is the induction variable)
     Value accVector = innerLoopK.getBody()->getArgument(1);
 
     // Load scalar from lhs: A[i, k]
     SmallVector<Value> lhsIndices;
     lhsIndices.push_back(i);
     lhsIndices.push_back(k);
-    auto lhsScalar = rewriter.create<memref::LoadOp>(loc, elementType, lhs,
-                                                       lhsIndices);
+    auto lhsScalar = rewriter.create<memref::LoadOp>(loc, elementType, lhs, lhsIndices);
+    
     // Broadcast to vector: replicate A[i,k] across vector
     auto lhsVector = rewriter.create<vector::BroadcastOp>(loc, vectorType, lhsScalar);
 
@@ -113,22 +121,86 @@ struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
 
     // Vector multiply-add: acc = acc + lhs * rhs
     auto mulResult = rewriter.create<vector::FMAOp>(loc, vectorType, lhsVector, rhsVector, accVector);
-    Value newAcc = mulResult;
-
+    
     // Yield the updated accumulator
     SmallVector<Value> yieldArgs;
-    yieldArgs.push_back(newAcc);
+    yieldArgs.push_back(mulResult);
     rewriter.create<scf::YieldOp>(loc, yieldArgs);
 
     // Get the final accumulator value (after the k loop completes)
     rewriter.setInsertionPointAfter(innerLoopK);
     Value finalAcc = innerLoopK.getResults()[0];
-
     // Store result vector: C[i, j:j+vectorLen-1] = acc
     SmallVector<Value> resultIndices;
     resultIndices.push_back(i);
     resultIndices.push_back(jBase);
     rewriter.create<vector::StoreOp>(loc, finalAcc, result, resultIndices);
+    
+    // Handle remainder: process remaining columns with scalar operations
+    // Only generate remainder loop if there's actually a remainder
+    rewriter.setInsertionPointAfter(jLoop);
+    
+    // For static dimensions with no remainder, skip generating remainder code entirely
+    // For static dimensions with remainder, generate remainder loop directly (no if needed)
+    // For dynamic dimensions, generate remainder loop with runtime check
+    if (hasRemainderAtCompileTime || !hasStaticDims) {
+      // For dynamic dimensions, we need a runtime check
+      if (!hasStaticDims) {
+        // Runtime check: fullVectorCount < n
+        auto hasRemainderCond = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, 
+                                                              fullVectorCount, nConst);
+        // Conditionally generate remainder loop only if needed
+        auto remainderIf = rewriter.create<scf::IfOp>(loc, hasRemainderCond, false);
+        rewriter.setInsertionPointToStart(remainderIf.thenBlock());
+      }
+      
+      // Create a scalar loop for the remainder columns (from fullVectorCount to n)
+      auto remainderLoop = rewriter.create<scf::ForOp>(loc, fullVectorCount, nConst, one);
+      rewriter.setInsertionPointToStart(remainderLoop.getBody());
+      auto jRem = remainderLoop.getInductionVar();
+      
+      // Scalar k-loop for remainder columns
+      auto zeroScalar = rewriter.create<arith::ConstantOp>(
+          loc, elementType, rewriter.getZeroAttr(elementType));
+      SmallVector<Value> scalarInitArgs;
+      scalarInitArgs.push_back(zeroScalar);
+      auto scalarKLoop = rewriter.create<scf::ForOp>(
+          loc, zero, kConst, one, scalarInitArgs);
+      rewriter.setInsertionPointToStart(scalarKLoop.getBody());
+      auto kScalar = scalarKLoop.getInductionVar();
+      Value accScalar = scalarKLoop.getBody()->getArgument(1);
+      
+      // Load A[i, k]
+      SmallVector<Value> lhsScalarIndices;
+      lhsScalarIndices.push_back(i);
+      lhsScalarIndices.push_back(kScalar);
+      auto aVal = rewriter.create<memref::LoadOp>(loc, elementType, lhs, lhsScalarIndices);
+      
+      // Load B[k, jRem]
+      SmallVector<Value> rhsScalarIndices;
+      rhsScalarIndices.push_back(kScalar);
+      rhsScalarIndices.push_back(jRem);
+      auto bVal = rewriter.create<memref::LoadOp>(loc, elementType, rhs, rhsScalarIndices);
+      
+      // Multiply and add: acc = acc + A[i,k] * B[k,jRem]
+      auto mulScalar = rewriter.create<arith::MulFOp>(loc, aVal, bVal);
+      auto addScalar = rewriter.create<arith::AddFOp>(loc, accScalar, mulScalar);
+      
+      // Yield updated accumulator
+      SmallVector<Value> scalarYieldArgs;
+      scalarYieldArgs.push_back(addScalar);
+      rewriter.create<scf::YieldOp>(loc, scalarYieldArgs);
+      
+      // Get final scalar accumulator
+      rewriter.setInsertionPointAfter(scalarKLoop);
+      Value finalScalarAcc = scalarKLoop.getResults()[0];
+      
+      // Store result: C[i, jRem] = acc
+      SmallVector<Value> resultScalarIndices;
+      resultScalarIndices.push_back(i);
+      resultScalarIndices.push_back(jRem);
+      rewriter.create<memref::StoreOp>(loc, finalScalarAcc, result, resultScalarIndices);
+    }
 
     // Replace the original matmul operation
     rewriter.eraseOp(matmulOp);
