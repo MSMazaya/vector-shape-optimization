@@ -34,6 +34,12 @@ static llvm::cl::opt<bool> useMaskedRemainderOpt(
     llvm::cl::desc("Use masked vector operations for remainder handling"),
     llvm::cl::init(false));
 
+static llvm::cl::opt<bool> useFullyMaskedOpt(
+  "linalg-to-vector-fully-masked",
+  llvm::cl::desc("Use fully masked method"),
+  llvm::cl::init(false)
+);
+
 // Calculate the vector length for 128-bit vectors based on element type
 int64_t getVectorLength(Type elementType) {
   unsigned bitWidth = elementType.getIntOrFloatBitWidth();
@@ -43,13 +49,15 @@ int64_t getVectorLength(Type elementType) {
 
 // Pattern to convert MatmulOp to vector operations
 struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
-  MatmulToVectorPattern(MLIRContext *context, bool unrollScalarK, bool useMaskedRemainder)
+  MatmulToVectorPattern(MLIRContext *context, bool unrollScalarK, bool useMaskedRemainder, bool useFullyMasked)
       : OpRewritePattern<linalg::MatmulOp>(context),
         unrollScalarK(unrollScalarK),
-        useMaskedRemainder(useMaskedRemainder) {}
+        useMaskedRemainder(useMaskedRemainder),
+        useFullyMasked(useFullyMasked) {}
 
   bool unrollScalarK;
   bool useMaskedRemainder;
+  bool useFullyMasked;
 
   LogicalResult matchAndRewrite(linalg::MatmulOp matmulOp,
                                 PatternRewriter &rewriter) const override {
@@ -194,6 +202,65 @@ struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
     };
 
     // Main vectorized loops:
+    if (useFullyMasked) {
+      // Outer loop over rows
+      auto outerLoopI = rewriter.create<scf::ForOp>(loc, zero, mConst, one);
+      rewriter.setInsertionPointToStart(outerLoopI.getBody());
+      Value i = outerLoopI.getInductionVar();
+      
+      // Single J-loop with masking for every iteration
+      auto jLoop = rewriter.create<scf::ForOp>(loc, zero, nConst, vectorLenConst);
+      rewriter.setInsertionPointToStart(jLoop.getBody());
+      Value j = jLoop.getInductionVar();
+      
+      // Calculate active elements: min(vectorLen, n - j)
+      Value remainingElements = rewriter.create<arith::SubIOp>(loc, nConst, j);
+      Value activeCount = rewriter.create<arith::MinSIOp>(loc, vectorLenConst, remainingElements);
+      
+      // Create mask
+      auto maskType = VectorType::get({vectorLen}, rewriter.getI1Type());
+      Value mask = rewriter.create<vector::CreateMaskOp>(loc, maskType, activeCount);
+      
+      // Zero vector
+      auto zeroElement = rewriter.create<arith::ConstantOp>(
+          loc, elementType, rewriter.getZeroAttr(elementType));
+      auto zeroVec = rewriter.create<vector::BroadcastOp>(loc, vectorType, zeroElement);
+      
+      // K-loop
+      SmallVector<Value> initArgs{zeroVec};
+      auto kLoop = rewriter.create<scf::ForOp>(loc, zero, kConst, one, initArgs);
+      rewriter.setInsertionPointToStart(kLoop.getBody());
+      Value k = kLoop.getInductionVar();
+      Value accVec = kLoop.getBody()->getArgument(1);
+      
+      // Load and broadcast A[i,k]
+      SmallVector<Value> lhsIdx{i, k};
+      auto aScalar = rewriter.create<memref::LoadOp>(loc, elementType, lhs, lhsIdx);
+      auto aVec = rewriter.create<vector::BroadcastOp>(loc, vectorType, aScalar);
+      
+      // Masked load B[k, j:j+vectorLen]
+      SmallVector<Value> rhsIdx{k, j};
+      auto bVec = rewriter.create<vector::MaskedLoadOp>(
+          loc, vectorType, rhs, rhsIdx, mask, zeroVec);
+      
+      // FMA
+      auto fmaResult = rewriter.create<vector::FMAOp>(loc, vectorType, aVec, bVec, accVec);
+      rewriter.create<scf::YieldOp>(loc, ValueRange{fmaResult.getResult()});
+      
+      // Masked store
+      rewriter.setInsertionPointAfter(kLoop);
+      Value finalVec = kLoop.getResults()[0];
+      SmallVector<Value> resultIdx{i, j};
+      rewriter.create<vector::MaskedStoreOp>(loc, result, resultIdx, mask, finalVec);
+      
+      rewriter.setInsertionPointAfter(jLoop);
+      rewriter.create<scf::YieldOp>(loc);
+      
+      rewriter.setInsertionPointAfter(outerLoopI);
+      rewriter.eraseOp(matmulOp);
+      return success();
+    }
+
 
     // Create loops for vectorized matmul
     // Outer loop for i (rows)
@@ -381,8 +448,9 @@ struct LinalgToVectorPass
         unrollScalarKOpt || (getenv("UNROLL_REMAINDER") != nullptr);
     bool useMaskedRemainder = useMaskedRemainderOpt ||
         (getenv("USE_MASKED_REMAINDER") != nullptr);
+    bool useFullyMasked = useFullyMaskedOpt;
         
-    patterns.add<MatmulToVectorPattern>(context, shouldUnroll, useMaskedRemainder);
+    patterns.add<MatmulToVectorPattern>(context, shouldUnroll, useMaskedRemainder, useFullyMasked);
 
     if (failed(applyPatternsAndFoldGreedily(func, std::move(patterns)))) {
       signalPassFailure();
