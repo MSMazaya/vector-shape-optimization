@@ -15,6 +15,7 @@
 
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
+#include <algorithm>
 
 using namespace mlir;
 using namespace mlir::linalg;
@@ -40,11 +41,38 @@ static llvm::cl::opt<bool> useFullyMaskedOpt(
   llvm::cl::init(false)
 );
 
-// Calculate the vector length for 128-bit vectors based on element type
-int64_t getVectorLength(Type elementType) {
+// Vector width option (128 for AVX, 512 for AVX-512)
+static llvm::cl::opt<int> vectorWidthOpt(
+    "linalg-to-vector-vector-width",
+    llvm::cl::desc("Vector width in bits (128 for AVX, 512 for AVX-512)"),
+    llvm::cl::init(128));
+
+// Stride option for fully masked mode
+static llvm::cl::opt<int> maskedStrideOpt(
+    "linalg-to-vector-masked-stride",
+    llvm::cl::desc("Stride for fully masked mode (in elements). If specified and leaves no remainder, use it; otherwise use max hardware size."),
+    llvm::cl::init(0));
+
+// Cache line size option for fully masked mode
+static llvm::cl::opt<bool> useCacheLineStrideOpt(
+    "linalg-to-vector-use-cache-line-stride",
+    llvm::cl::desc("Use cache line size (64 bytes) as stride heuristic for fully masked mode"),
+    llvm::cl::init(false));
+
+// Calculate the vector length based on element type and vector width
+int64_t getVectorLength(Type elementType, int vectorWidthBits) {
   unsigned bitWidth = elementType.getIntOrFloatBitWidth();
-  // For 128-bit vectors: 128 / bit_width
-  return 128 / bitWidth;
+  return vectorWidthBits / bitWidth;
+}
+
+// Calculate cache line size stride (64 bytes / element size), capped at vectorLen
+int64_t getCacheLineStride(Type elementType, int64_t vectorLen) {
+  unsigned bitWidth = elementType.getIntOrFloatBitWidth();
+  unsigned byteWidth = bitWidth / 8;
+  int64_t cacheLineBytes = 64;
+  int64_t cacheLineStride = cacheLineBytes / byteWidth;
+  // Cap at hardware vector width
+  return std::min(cacheLineStride, vectorLen);
 }
 
 // Pattern to convert MatmulOp to vector operations
@@ -77,9 +105,9 @@ struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
     }
 
     Type elementType = lhsType.getElementType();
-    int64_t vectorLen = getVectorLength(elementType);
+    int64_t vectorLen = getVectorLength(elementType, vectorWidthOpt);
 
-    // Create vector type for 128-bit vectors
+    // Create vector type
     VectorType vectorType = VectorType::get({vectorLen}, elementType);
 
     // Get dimension sizes
@@ -203,28 +231,113 @@ struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
 
     // Main vectorized loops:
     if (useFullyMasked) {
+      // Calculate effective stride based on heuristics:
+      // 1. If stride is specified and leaves no remainder, use it (capped at hardware max)
+      // 2. If cache line stride is enabled and leaves no remainder, use it (capped at hardware max)
+      // 3. Otherwise, use max hardware size (vectorLen)
+      int64_t effectiveStride = vectorLen;
+      bool useCustomStride = false;
+      
+      // Calculate cache line stride if enabled
+      int64_t cacheLineStride = 0;
+      if (useCacheLineStrideOpt) {
+        cacheLineStride = getCacheLineStride(elementType, vectorLen);
+      }
+      
+      if (maskedStrideOpt > 0) {
+        if (hasStaticDims) {
+          // Compile-time check: if stride leaves no remainder and is within hardware limits
+          if (n % maskedStrideOpt == 0 && maskedStrideOpt <= vectorLen) {
+            effectiveStride = maskedStrideOpt;
+            useCustomStride = true;
+          }
+        } else {
+          // For dynamic dimensions, we'll check at runtime
+          // For now, we'll use the specified stride if it's within hardware limits
+          if (maskedStrideOpt <= vectorLen) {
+            effectiveStride = maskedStrideOpt;
+            useCustomStride = true;
+          }
+        }
+      } else if (useCacheLineStrideOpt && cacheLineStride > 0) {
+        // Try cache line stride if no explicit stride specified
+        if (hasStaticDims) {
+          // Compile-time check: if cache line stride leaves no remainder
+          if (n % cacheLineStride == 0 && cacheLineStride <= vectorLen) {
+            effectiveStride = cacheLineStride;
+            useCustomStride = true;
+          }
+        } else {
+          // For dynamic dimensions, we'll check at runtime
+          if (cacheLineStride <= vectorLen) {
+            effectiveStride = cacheLineStride;
+            useCustomStride = true;
+          }
+        }
+      }
+      
+      // Create vector type and stride constant
+      VectorType effectiveVectorType;
+      Value finalStride;
+      
+      if (hasStaticDims && useCustomStride) {
+        // Static dimensions: use effective stride as vector width
+        effectiveVectorType = VectorType::get({effectiveStride}, elementType);
+        finalStride = rewriter.create<arith::ConstantIndexOp>(loc, effectiveStride);
+      } else {
+        // Dynamic dimensions or no custom stride: use hardware max
+        effectiveVectorType = vectorType;
+        finalStride = vectorLenConst;
+        
+        // For dynamic dimensions with custom stride, add runtime check
+        if (!hasStaticDims) {
+          Value strideCandidate = vectorLenConst;
+          
+          if (maskedStrideOpt > 0 && maskedStrideOpt <= vectorLen) {
+            strideCandidate = rewriter.create<arith::ConstantIndexOp>(loc, maskedStrideOpt);
+          } else if (useCacheLineStrideOpt && cacheLineStride > 0 && cacheLineStride <= vectorLen) {
+            strideCandidate = rewriter.create<arith::ConstantIndexOp>(loc, cacheLineStride);
+          }
+          
+          if (strideCandidate != vectorLenConst) {
+            auto strideRemainder = rewriter.create<arith::RemUIOp>(loc, nConst, strideCandidate);
+            auto noRemainder = rewriter.create<arith::CmpIOp>(
+                loc, arith::CmpIPredicate::eq, strideRemainder, zero);
+            
+            // Select stride: if no remainder, use candidate stride; otherwise use vectorLen
+            finalStride = rewriter.create<arith::SelectOp>(
+                loc, noRemainder, strideCandidate, vectorLenConst);
+          }
+        }
+      }
+      
       // Outer loop over rows
       auto outerLoopI = rewriter.create<scf::ForOp>(loc, zero, mConst, one);
       rewriter.setInsertionPointToStart(outerLoopI.getBody());
       Value i = outerLoopI.getInductionVar();
       
       // Single J-loop with masking for every iteration
-      auto jLoop = rewriter.create<scf::ForOp>(loc, zero, nConst, vectorLenConst);
+      // Use final stride for loop increment
+      auto jLoop = rewriter.create<scf::ForOp>(loc, zero, nConst, finalStride);
       rewriter.setInsertionPointToStart(jLoop.getBody());
       Value j = jLoop.getInductionVar();
       
-      // Calculate active elements: min(vectorLen, n - j)
+      // Calculate active elements: min(finalStride, n - j)
       Value remainingElements = rewriter.create<arith::SubIOp>(loc, nConst, j);
-      Value activeCount = rewriter.create<arith::MinSIOp>(loc, vectorLenConst, remainingElements);
+      Value activeCount = rewriter.create<arith::MinSIOp>(loc, finalStride, remainingElements);
       
-      // Create mask
-      auto maskType = VectorType::get({vectorLen}, rewriter.getI1Type());
+      // Create mask - use effective vector type size
+      // For static dimensions with custom stride, use effectiveStride
+      // For dynamic or default case, use vectorLen (hardware max)
+      auto maskType = hasStaticDims && useCustomStride 
+          ? VectorType::get({effectiveStride}, rewriter.getI1Type())
+          : VectorType::get({vectorLen}, rewriter.getI1Type());
       Value mask = rewriter.create<vector::CreateMaskOp>(loc, maskType, activeCount);
       
-      // Zero vector
+      // Zero vector with effective vector type
       auto zeroElement = rewriter.create<arith::ConstantOp>(
           loc, elementType, rewriter.getZeroAttr(elementType));
-      auto zeroVec = rewriter.create<vector::BroadcastOp>(loc, vectorType, zeroElement);
+      auto zeroVec = rewriter.create<vector::BroadcastOp>(loc, effectiveVectorType, zeroElement);
       
       // K-loop
       SmallVector<Value> initArgs{zeroVec};
@@ -236,15 +349,15 @@ struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
       // Load and broadcast A[i,k]
       SmallVector<Value> lhsIdx{i, k};
       auto aScalar = rewriter.create<memref::LoadOp>(loc, elementType, lhs, lhsIdx);
-      auto aVec = rewriter.create<vector::BroadcastOp>(loc, vectorType, aScalar);
+      auto aVec = rewriter.create<vector::BroadcastOp>(loc, effectiveVectorType, aScalar);
       
-      // Masked load B[k, j:j+vectorLen]
+      // Masked load B[k, j:j+finalStride]
       SmallVector<Value> rhsIdx{k, j};
       auto bVec = rewriter.create<vector::MaskedLoadOp>(
-          loc, vectorType, rhs, rhsIdx, mask, zeroVec);
+          loc, effectiveVectorType, rhs, rhsIdx, mask, zeroVec);
       
       // FMA
-      auto fmaResult = rewriter.create<vector::FMAOp>(loc, vectorType, aVec, bVec, accVec);
+      auto fmaResult = rewriter.create<vector::FMAOp>(loc, effectiveVectorType, aVec, bVec, accVec);
       rewriter.create<scf::YieldOp>(loc, ValueRange{fmaResult.getResult()});
       
       // Masked store
@@ -253,9 +366,11 @@ struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
       SmallVector<Value> resultIdx{i, j};
       rewriter.create<vector::MaskedStoreOp>(loc, result, resultIdx, mask, finalVec);
       
+      // jLoop doesn't need a yield since it has no iter_args
+      // Just move insertion point after it
       rewriter.setInsertionPointAfter(jLoop);
-      rewriter.create<scf::YieldOp>(loc);
       
+      // outerLoopI also doesn't need a yield since it has no iter_args
       rewriter.setInsertionPointAfter(outerLoopI);
       rewriter.eraseOp(matmulOp);
       return success();
@@ -428,8 +543,8 @@ struct LinalgToVectorPass
   StringRef getArgument() const final { return "linalg-to-vector"; }
 
   StringRef getDescription() const final {
-    return "Convert linalg operations to vector instructions with 128-bit "
-           "vectors";
+    return "Convert linalg operations to vector instructions with configurable "
+           "vector width (default 128-bit for AVX, use --linalg-to-vector-vector-width=512 for AVX-512)";
   }
 
   void getDependentDialects(DialectRegistry &registry) const override {
