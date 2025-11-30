@@ -86,7 +86,8 @@ struct StrategyDecision {
   enum StrategyType {
     MASK_BODY,      // Fully masked body with strides
     MASK_REMAINDER, // Masked remainder only
-    UNROLL_REMAINDER // Unrolled remainder
+    UNROLL_REMAINDER, // Unrolled remainder
+    NO_MASKING      // No masking - use regular vector ops (for perfect tiles)
   };
   
   StrategyType strategy;
@@ -243,11 +244,12 @@ StrategyDecision determineStrategy(
   int64_t remainder = n % vectorLen;
   bool hasRemainder = (remainder != 0);
   
-  // If no remainder, use full vector size
+  // If no remainder, use regular vector operations (no masking overhead)
+  // Perfect tiles should not use masking - it adds unnecessary overhead
   if (!hasRemainder) {
-    decision.strategy = StrategyDecision::MASK_BODY;
+    decision.strategy = StrategyDecision::NO_MASKING;
     decision.stride = vectorLen;
-    decision.useStride = true;
+    decision.useStride = false; // No stride needed - perfect alignment
     decision.cacheAligned = (getCacheLineStride(elementType, vectorLen) == vectorLen);
     decision.eliminatesRemainder = true;
     return decision;
@@ -493,8 +495,13 @@ struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
     // Main vectorized loops:
     // Use heuristic-determined strategy, or fall back to explicit flags
     bool shouldUseFullyMasked = (strategy.strategy == StrategyDecision::MASK_BODY) || useFullyMasked;
+    bool shouldUseNoMasking = (strategy.strategy == StrategyDecision::NO_MASKING);
     
-    if (shouldUseFullyMasked) {
+    // For perfect tiles (no remainder), use regular vector operations without masking
+    if (shouldUseNoMasking) {
+      // Skip the fully masked path and go straight to regular vectorized loops below
+      // This avoids masking overhead for perfect tiles
+    } else if (shouldUseFullyMasked) {
       // Use heuristic-determined stride, or override with explicit options
       int64_t effectiveStride = strategy.useStride ? strategy.stride : vectorLen;
       bool useCustomStride = strategy.useStride;
@@ -635,8 +642,10 @@ struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
       return success();
     }
 
+    // For NO_MASKING strategy (perfect tiles), skip masking and use regular vector ops
+    // This falls through to the regular vectorized loops below (no masking overhead)
 
-    // Create loops for vectorized matmul
+    // Create loops for vectorized matmul (regular, no masking)
     // Outer loop for i (rows)
     auto outerLoopI = rewriter.create<scf::ForOp>(loc, zero, mConst, one);
     rewriter.setInsertionPointToStart(outerLoopI.getBody());
