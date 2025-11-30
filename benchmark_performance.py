@@ -1,0 +1,798 @@
+#!/usr/bin/env python3
+"""
+Benchmark heuristic-based strategy selection against explicit strategies.
+Compares scalar remainder, unrolled remainder, masked remainder, and heuristic-based selection.
+"""
+
+import progressbar
+import numpy as np
+import matplotlib.pyplot as plt
+import sys
+import os
+import subprocess
+import re
+import json
+import shutil
+import tempfile
+import matplotlib
+matplotlib.use('Agg')
+
+widgets = [
+    'Running: ', progressbar.Percentage(),
+    ' ', progressbar.Bar(marker=progressbar.RotatingMarker()),
+    ' ', progressbar.ETA(),
+    ' ', progressbar.FileTransferSpeed(),
+]
+
+
+def get_matrix_size(test_file):
+    """Extract matrix size from MLIR file, returns (M, N) tuple"""
+    try:
+        with open(test_file, 'r') as f:
+            content = f.read()
+            match = re.search(
+                r'outs\([^:]+:\s*memref<(\d+)x(\d+)x(f32|f64)>', content)
+            if match:
+                m = int(match.group(1))
+                n = int(match.group(2))
+                return (m, n)
+
+            matches = list(re.finditer(
+                r'memref<(\d+)x(\d+)x(f32|f64)>', content))
+            if matches:
+                last_match = matches[-1]
+                m = int(last_match.group(1))
+                n = int(last_match.group(2))
+                return (m, n)
+    except:
+        pass
+    return None
+
+
+def compile_and_benchmark(test_file, vector_isa, strategy_type, num_runs=100, llvm_path_override=None):
+    """Compile and benchmark a test case with the given strategy."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if llvm_path_override:
+        llvm_path = llvm_path_override
+    else:
+        llvm_path = os.environ.get('LLVM_PROJECT_PATH',
+                                   '/home/mazaya/Documents/cmu/interviews/vorticity/llvm-project-vorticity')
+
+    # Set compilation flags based on vector ISA
+    if vector_isa == "avx512":
+        llc_attrs = "-mattr=+avx512f,+avx512vl"
+        clang_flags = "-mavx512f -mavx512vl"
+        vector_width_flag = "--linalg-to-vector-vector-width=512"
+        vector_len = 16  # For f32
+    elif vector_isa == "avx2":
+        llc_attrs = "-mattr=+avx2,+fma"
+        clang_flags = "-mavx2 -mfma"
+        vector_width_flag = "--linalg-to-vector-vector-width=256"
+        vector_len = 8  # For f32
+    else:  # avx
+        llc_attrs = "-mattr=+avx,+fma"
+        clang_flags = "-mavx -mfma"
+        vector_width_flag = "--linalg-to-vector-vector-width=128"
+        vector_len = 4  # For f32
+
+    temp_dir = tempfile.mkdtemp()
+    try:
+        with open(test_file, 'r') as f:
+            content = f.read()
+            func_match = re.search(r'func\.func @(\w+)', content)
+            func_name = func_match.group(1) if func_match else "matmul"
+
+            if 'f64' in content or 'double' in content:
+                element_type = 'f64'
+                c_type = 'double'
+                alignment = 64
+            else:
+                element_type = 'f32'
+                c_type = 'float'
+                alignment = 32
+
+        dims = get_matrix_size(test_file)
+        if not dims:
+            return None
+        m, n = dims
+
+        scalar_mlir = os.path.join(temp_dir, "scalar.mlir")
+        scalar_ll = os.path.join(temp_dir, "scalar.ll")
+        scalar_o = os.path.join(temp_dir, "scalar.o")
+
+        subprocess.run([
+            f"{llvm_path}/build/bin/mlir-opt",
+            test_file,
+            "--linalg-generalize-named-ops",
+            "--convert-linalg-to-loops",
+            "--convert-scf-to-cf",
+            "--convert-cf-to-llvm",
+            "--convert-func-to-llvm",
+            "--memref-expand",
+            "--finalize-memref-to-llvm",
+            "--convert-arith-to-llvm",
+            "--reconcile-unrealized-casts",
+            "-o", scalar_mlir
+        ], capture_output=True, check=True)
+
+        subprocess.run([
+            f"{llvm_path}/build/bin/mlir-translate",
+            "--mlir-to-llvmir",
+            scalar_mlir,
+            "-o", scalar_ll
+        ], capture_output=True, check=True)
+
+        subprocess.run([
+            f"{llvm_path}/build/bin/llc",
+            "-march=x86-64",
+            "-O3",
+            "-filetype=obj",
+            scalar_ll,
+            "-o", scalar_o
+        ], capture_output=True, check=True)
+
+        vectorized_mlir = os.path.join(temp_dir, "vectorized.mlir")
+        vectorized_lowered = os.path.join(temp_dir, "vectorized_lowered.mlir")
+        vectorized_ll = os.path.join(temp_dir, "vectorized.ll")
+        vectorized_o = os.path.join(temp_dir, "vectorized.o")
+
+        preprocessed_file = os.path.join(temp_dir, "preprocessed.mlir")
+        with open(test_file, 'r') as f_in:
+            content = f_in.read()
+
+        if 'func.return' not in content:
+            content = re.sub(r'(?<!func\.)\breturn\b', 'func.return', content)
+        if 'module {' not in content:
+            content = f"module {{\n{content}\n}}\n"
+
+        with open(preprocessed_file, 'w') as f_out:
+            f_out.write(content)
+        vector_opt_cmd = [
+            f"{script_dir}/build/tools/vector-shape-opt/vector-shape-opt",
+            "--linalg-to-vector",
+            vector_width_flag
+        ]
+
+        if strategy_type == "unrolled_remainder":
+            vector_opt_cmd.append("--linalg-to-vector-unroll-scalar-k")
+        elif strategy_type == "masked_remainder":
+            vector_opt_cmd.append("--linalg-to-vector-use-masked-remainder")
+        elif strategy_type == "heuristic":
+            vector_opt_cmd.append("--linalg-to-vector-use-heuristic")
+            vector_opt_cmd.append("--linalg-to-vector-debug-strategy")
+
+        result = subprocess.run(
+            vector_opt_cmd + [preprocessed_file],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False
+        )
+
+        chosen_strategy = None
+        if strategy_type == "heuristic" and result.stderr:
+            for line in result.stderr.split('\n'):
+                if "[Strategy Debug] Selected:" in line:
+                    if "NO_MASKING" in line:
+                        chosen_strategy = "NO_MASKING"
+                    elif "UNROLL_REMAINDER" in line:
+                        chosen_strategy = "UNROLL_REMAINDER"
+                    elif "MASK_REMAINDER" in line:
+                        chosen_strategy = "MASK_REMAINDER"
+                    elif "MASK_BODY" in line:
+                        chosen_strategy = "MASK_BODY"
+                    break
+
+        if result.returncode != 0:
+            error_msg = result.stderr[:500] if result.stderr else "Unknown error"
+            print(f"    vector-shape-opt error: {error_msg}")
+            if result.stdout:
+                print(f"    stdout: {result.stdout[:200]}")
+            raise subprocess.CalledProcessError(
+                result.returncode, vector_opt_cmd, error_msg
+            )
+        with open(vectorized_mlir, 'w') as f:
+            f.write(result.stdout)
+        subprocess.run([
+            f"{llvm_path}/build/bin/mlir-opt",
+            vectorized_mlir,
+            "--memref-expand",
+            "--finalize-memref-to-llvm",
+            "--convert-vector-to-llvm",
+            "--convert-scf-to-cf",
+            "--convert-cf-to-llvm",
+            "--convert-func-to-llvm",
+            "--convert-arith-to-llvm",
+            "--reconcile-unrealized-casts",
+            "-o", vectorized_lowered
+        ], capture_output=True, check=True)
+
+        with open(vectorized_lowered, 'r') as f:
+            content = f.read()
+        content = content.replace(f"@{func_name}", "@vectorized_matmul")
+        with open(vectorized_lowered, 'w') as f:
+            f.write(content)
+        subprocess.run([
+            f"{llvm_path}/build/bin/mlir-translate",
+            "--mlir-to-llvmir",
+            vectorized_lowered,
+            "-o", vectorized_ll
+        ], capture_output=True, check=True)
+
+        subprocess.run([
+            f"{llvm_path}/build/bin/llc",
+            "-march=x86-64",
+            llc_attrs,
+            "-O3",
+            "-filetype=obj",
+            vectorized_ll,
+            "-o", vectorized_o
+        ], capture_output=True, check=True)
+
+        wrapper_c = os.path.join(temp_dir, "wrapper.c")
+        with open(wrapper_c, 'w') as f:
+            f.write(f"""
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <math.h>
+
+void {func_name}({c_type}* alloc, {c_type}* aligned, int64_t offset, int64_t size0, int64_t size1, int64_t stride0, int64_t stride1,
+                 {c_type}* alloc2, {c_type}* aligned2, int64_t offset2, int64_t size02, int64_t size12, int64_t stride02, int64_t stride12,
+                 {c_type}* alloc3, {c_type}* aligned3, int64_t offset3, int64_t size03, int64_t size13, int64_t stride03, int64_t stride13);
+
+void vectorized_matmul({c_type}* alloc, {c_type}* aligned, int64_t offset, int64_t size0, int64_t size1, int64_t stride0, int64_t stride1,
+                       {c_type}* alloc2, {c_type}* aligned2, int64_t offset2, int64_t size02, int64_t size12, int64_t stride02, int64_t stride12,
+                       {c_type}* alloc3, {c_type}* aligned3, int64_t offset3, int64_t size03, int64_t size13, int64_t stride03, int64_t stride13);
+
+int main() {{
+    int M = {m}, N = {n}, K = {m};
+    int iterations = 100000;
+    
+    {c_type}* A = ({c_type}*)aligned_alloc({alignment}, M * K * sizeof({c_type}));
+    {c_type}* B = ({c_type}*)aligned_alloc({alignment}, K * N * sizeof({c_type}));
+    {c_type}* C_scalar = ({c_type}*)aligned_alloc({alignment}, M * N * sizeof({c_type}));
+    {c_type}* C_vector = ({c_type}*)aligned_alloc({alignment}, M * N * sizeof({c_type}));
+    
+    for (int i = 0; i < M * K; i++) A[i] = ({c_type})rand() / RAND_MAX;
+    for (int i = 0; i < K * N; i++) B[i] = ({c_type})rand() / RAND_MAX;
+    
+    clock_t start = clock();
+    for (int i = 0; i < iterations; i++) {{
+        {func_name}(A, A, 0, M, K, K, 1,
+                   B, B, 0, K, N, N, 1,
+                   C_scalar, C_scalar, 0, M, N, N, 1);
+    }}
+    clock_t end = clock();
+    double scalar_time = ((double)(end - start)) / CLOCKS_PER_SEC;
+    
+    start = clock();
+    for (int i = 0; i < iterations; i++) {{
+        vectorized_matmul(A, A, 0, M, K, K, 1,
+                         B, B, 0, K, N, N, 1,
+                         C_vector, C_vector, 0, M, N, N, 1);
+    }}
+    end = clock();
+    double vector_time = ((double)(end - start)) / CLOCKS_PER_SEC;
+    
+    double speedup = scalar_time / vector_time;
+    printf("Speedup: %.2fx\\n", speedup);
+    
+    free(A);
+    free(B);
+    free(C_scalar);
+    free(C_vector);
+    return 0;
+}}
+""")
+
+        executable = os.path.join(temp_dir, "benchmark")
+        clang_cmd = ["clang", "-O3"] + clang_flags.split() + [
+            wrapper_c, scalar_o, vectorized_o,
+            "-o", executable,
+            "-lm"
+        ]
+        subprocess.run(clang_cmd, capture_output=True, check=True)
+
+        speedups = []
+        if num_runs > 1:
+            bar = progressbar.ProgressBar(max_value=num_runs, widgets=widgets)
+            bar.start()
+
+        for run_num in range(num_runs):
+            try:
+                result = subprocess.run(
+                    [executable],
+                    capture_output=True,
+                    text=True,
+                    timeout=60
+                )
+            except subprocess.TimeoutExpired:
+                if run_num == 0:
+                    print(f"    Error: Timeout after 60 seconds")
+                if num_runs > 1:
+                    bar.finish()
+                return None
+
+            output = result.stdout + result.stderr
+            if result.returncode != 0:
+                if run_num == 0:
+                    if result.returncode == -4:
+                        error_msg = f"Crash (SIGILL) - possibly AVX-512 not supported on this CPU"
+                        if output:
+                            error_msg += f"\n    Output: {output[:300]}"
+                    else:
+                        error_msg = output[:
+                                           500] if output else f"Exit code {result.returncode}"
+                    print(
+                        f"    Error (exit code {result.returncode}): {error_msg}")
+                if num_runs > 1:
+                    bar.finish()
+                return None
+
+            match = re.search(r'Speedup:\s+(\d+\.\d+)x', output)
+            if match:
+                speedups.append(float(match.group(1)))
+            else:
+                if run_num == 0:
+                    print(f"    Error: Could not parse speedup from output")
+                if num_runs > 1:
+                    bar.finish()
+                return None
+
+            if num_runs > 1:
+                bar.update(run_num + 1)
+
+        if num_runs > 1:
+            bar.finish()
+
+        if speedups:
+            median_speedup = np.median(speedups)
+            if strategy_type == "heuristic":
+                return (median_speedup, chosen_strategy)
+            return median_speedup
+
+        if strategy_type == "heuristic":
+            return (None, chosen_strategy)
+        return None
+
+    except subprocess.CalledProcessError as e:
+        error_msg = ""
+        if hasattr(e, 'stderr') and e.stderr:
+            error_msg = e.stderr[:500]
+        elif hasattr(e, 'output') and e.output:
+            error_msg = e.output[:500]
+        else:
+            error_msg = str(e)
+        if "vector-shape-opt error" not in error_msg:
+            print(f"    Compilation error: {error_msg}")
+        return None
+    except Exception as e:
+        print(f"    Exception: {str(e)}")
+        return None
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def run_benchmark_local(test_file, vector_isa, num_runs=100, llvm_path_override=None):
+    """Run all strategies locally."""
+    strategies = ["scalar_remainder", "unrolled_remainder",
+                  "masked_remainder", "heuristic"]
+    results = {}
+    heuristic_strategy = None
+
+    for strategy in strategies:
+        print(f"  Benchmarking {strategy}...")
+        result = compile_and_benchmark(
+            test_file, vector_isa, strategy, num_runs, llvm_path_override)
+
+        if strategy == "heuristic":
+            if result and result[0] is not None:
+                speedup, chosen_strategy = result
+                results[strategy] = speedup
+                heuristic_strategy = chosen_strategy
+                print(
+                    f"    Speedup: {speedup:.2f}x (chose: {chosen_strategy})")
+            else:
+                results[strategy] = None
+                print(f"    Failed")
+        else:
+            results[strategy] = result
+            if result:
+                print(f"    Speedup: {result:.2f}x")
+            else:
+                print(f"    Failed")
+
+    return results, heuristic_strategy
+
+
+def run_benchmark_remote(test_file, vector_isa, machine_config, num_runs=100):
+    """Run all strategies on remote machine via SSH."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    benchmark_script_name = "benchmark_heuristic.py"
+    local_benchmark_script = os.path.join(script_dir, benchmark_script_name)
+
+    ssh_host = machine_config["ssh_host"]
+    ssh_key = machine_config.get("ssh_key", "")
+    remote_path = machine_config["remote_path"]
+    llvm_path = machine_config.get("llvm_project_path", "")
+
+    test_file_abs = os.path.abspath(test_file)
+    test_file_name = os.path.basename(test_file)
+
+    print(f"  Copying scripts and {test_file_name} to remote machine...")
+    scp_cmd_script = ["scp"]
+    scp_cmd_file = ["scp"]
+    if ssh_key:
+        scp_cmd_script.extend(["-i", ssh_key])
+        scp_cmd_file.extend(["-i", ssh_key])
+
+    scp_cmd_script.extend(
+        [local_benchmark_script, f"{ssh_host}:{remote_path}/"])
+    subprocess.run(scp_cmd_script, capture_output=True, check=True)
+
+    scp_cmd_file.extend([test_file_abs, f"{ssh_host}:{remote_path}/tests/"])
+    subprocess.run(scp_cmd_file, capture_output=True, check=True)
+
+    remote_test_file = f"tests/{test_file_name}"
+
+    ssh_cmd = ["ssh"]
+    if ssh_key:
+        ssh_cmd.extend(["-i", ssh_key])
+    ssh_cmd.append(ssh_host)
+
+    remote_cmd = f"""
+cd {remote_path} && \
+export LLVM_PROJECT_PATH="{llvm_path}" && \
+export PATH="$LLVM_PROJECT_PATH/build/bin:$PATH" && \
+chmod +x {benchmark_script_name} && \
+python3 {benchmark_script_name} --machine local --{vector_isa} {remote_test_file} 2>&1
+"""
+
+    print(f"  Running benchmark on remote machine...")
+    result = subprocess.run(
+        ssh_cmd + [remote_cmd],
+        capture_output=True,
+        text=True,
+        timeout=3600  # 1 hour timeout
+    )
+
+    output = result.stdout + result.stderr
+
+    if result.returncode != 0:
+        print(f"    Remote execution error (return code {result.returncode}):")
+        print(f"    STDOUT: {result.stdout[:1000]}")
+        print(f"    STDERR: {result.stderr[:1000]}")
+        return {}
+
+    results = {}
+    strategies = ["scalar_remainder", "unrolled_remainder",
+                  "masked_remainder", "heuristic"]
+    heuristic_strategy = None
+
+    lines = output.split('\n')
+    current_strategy = None
+
+    for i, line in enumerate(lines):
+        for strategy in strategies:
+            if f'Benchmarking {strategy}...' in line:
+                current_strategy = strategy
+                break
+
+        if current_strategy and 'Speedup:' in line:
+            match = re.search(r'Speedup:\s+(\d+\.\d+)x', line)
+            if match:
+                speedup = float(match.group(1))
+                results[current_strategy] = speedup
+
+                if current_strategy == "heuristic" and "(chose:" in line:
+                    strategy_match = re.search(r'\(chose:\s+(\w+)\)', line)
+                    if strategy_match:
+                        heuristic_strategy = strategy_match.group(1)
+
+                current_strategy = None
+
+        if current_strategy and ('Error:' in line or 'Failed' in line or 'Exception' in line):
+            error_lines = []
+            for j in range(max(0, i-2), min(len(lines), i+5)):
+                error_lines.append(lines[j])
+            print(f"    Error for {current_strategy}: {' '.join(error_lines)}")
+            current_strategy = None
+
+    if len(results) < len(strategies):
+        print(
+            f"    Warning: Only got {len(results)}/{len(strategies)} results")
+        print(f"    Output preview: {output[:500]}")
+        if 'error' in output.lower() or 'Error' in output:
+            print(
+                f"    Error in output: {output[output.lower().find('error'):output.lower().find('error')+200]}")
+
+    return results, heuristic_strategy
+
+
+def load_machine_config():
+    """Load machine configuration from JSON file."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    config_file = os.path.join(script_dir, "machine_config.json")
+
+    if not os.path.exists(config_file):
+        default_config = {
+            "machines": {
+                "local": {
+                    "type": "local",
+                    "description": "Local machine",
+                    "output_dir": "output/local"
+                }
+            },
+            "default_machine": "local"
+        }
+        with open(config_file, 'w') as f:
+            json.dump(default_config, f, indent=2)
+        return default_config
+
+    with open(config_file, 'r') as f:
+        return json.load(f)
+
+
+def main():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    tests_dir = os.path.join(script_dir, "tests")
+
+    config = load_machine_config()
+    machines = config["machines"]
+    default_machine = config.get("default_machine", "local")
+
+    vector_isa = "avx"
+    machine_name = default_machine
+    test_files = []
+
+    if "--machine" in sys.argv:
+        idx = sys.argv.index("--machine")
+        if idx + 1 < len(sys.argv):
+            machine_name = sys.argv[idx + 1]
+            sys.argv.pop(idx)
+            sys.argv.pop(idx)
+        else:
+            print("Error: --machine requires a machine name")
+            return 1
+
+    if "--avx512" in sys.argv:
+        vector_isa = "avx512"
+        sys.argv.remove("--avx512")
+    elif "--avx2" in sys.argv:
+        vector_isa = "avx2"
+        sys.argv.remove("--avx2")
+    elif "--avx" in sys.argv:
+        vector_isa = "avx"
+        sys.argv.remove("--avx")
+
+    if machine_name not in machines:
+        print(f"Error: Unknown machine '{machine_name}'")
+        return 1
+
+    machine_config = machines[machine_name]
+    machine_type = machine_config.get("type", "local")
+    base_output_dir = os.path.join(script_dir, "output", machine_type)
+    output_dir = os.path.join(base_output_dir, vector_isa)
+    os.makedirs(output_dir, exist_ok=True)
+
+    print(f"Using machine: {machine_name}")
+    print(f"Vector ISA: {vector_isa.upper()}")
+    print(f"Output directory: {output_dir}")
+    print()
+
+    if len(sys.argv) > 1:
+        test_files = [f for f in sys.argv[1:] if os.path.isfile(f)]
+    else:
+        import glob
+        all_files = sorted(glob.glob(os.path.join(tests_dir, "test*.mlir")))
+        test_files = [f for f in all_files if not any(
+            suffix in os.path.basename(f)
+            for suffix in ['_lowered.mlir', '_vectorized.mlir', 'benchmark_template.mlir', 'test_with_timing.mlir']
+        )]
+
+    if not test_files:
+        print("No test files found")
+        return
+
+    if vector_isa == "avx512":
+        isa_name = "AVX-512"
+    elif vector_isa == "avx2":
+        isa_name = "AVX2"
+    else:
+        isa_name = "AVX"
+    print(f"Running benchmarks: Blind Strategies vs Heuristic ({isa_name})")
+    print()
+
+    all_results = []
+    for test_file in test_files:
+        test_name = os.path.basename(test_file).replace('.mlir', '')
+        dims = get_matrix_size(test_file)
+
+        if not dims:
+            print(f"Skipping {test_name} (could not extract matrix size)")
+            continue
+
+        m, n = dims
+        print(f"Benchmarking {test_name} ({m}x{n})...")
+
+        if machine_config["type"] == "remote":
+            results, heuristic_strategy = run_benchmark_remote(
+                test_file, vector_isa, machine_config, num_runs=10)
+        else:
+            llvm_path = machine_config.get("llvm_project_path", None)
+            results, heuristic_strategy = run_benchmark_local(
+                test_file, vector_isa, num_runs=10, llvm_path_override=llvm_path)
+
+        if any(results.values()):
+            all_results.append({
+                'name': test_name,
+                'size': dims,
+                'heuristic_strategy': heuristic_strategy,
+                **results
+            })
+            print()
+        else:
+            print(f"  Failed")
+            print()
+
+    if not all_results:
+        print("No successful benchmarks")
+        return
+
+    names = [r['name'] for r in all_results]
+    sizes = [r['size'] for r in all_results]
+
+    strategies = ["scalar_remainder", "unrolled_remainder",
+                  "masked_remainder", "heuristic"]
+    strategy_labels = {
+        "scalar_remainder": "Scalar Remainder",
+        "unrolled_remainder": "Unrolled Remainder",
+        "masked_remainder": "Masked Remainder",
+        "heuristic": "Heuristic-Based"
+    }
+
+    # Create bar chart
+    fig, ax = plt.subplots(figsize=(20, 10))
+
+    x = np.arange(len(names))
+    width = 0.2
+    colors = ['#3498db', '#2ecc71', '#e74c3c', '#f39c12']
+
+    bars = []
+    for i, strategy in enumerate(strategies):
+        values = [r.get(strategy, 0) if r.get(strategy)
+                  is not None else 0 for r in all_results]
+        bar = ax.bar(x + i * width, values, width,
+                     label=strategy_labels[strategy],
+                     color=colors[i], alpha=0.8, edgecolor='black', linewidth=1.5)
+        bars.append(bar)
+
+    ax.axhline(y=1.0, color='red', linestyle='--', linewidth=2,
+               label='Baseline (1.0x)', zorder=0)
+
+    ax.set_xlabel('Test Case (Matrix Size)', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Speedup (Scalar Time / Vectorized Time)',
+                  fontsize=12, fontweight='bold')
+    ax.set_title(f'Strategy Comparison: Blind vs Heuristic ({isa_name})',
+                 fontsize=14, fontweight='bold')
+    ax.set_xticks(x + width * 1.5)
+    ax.set_xticklabels([f"{n}\n{m}x{n_val}" for n, (m, n_val) in zip(names, sizes)],
+                       fontsize=10)
+    ax.legend(fontsize=11)
+    ax.grid(axis='y', alpha=0.3, linestyle='--')
+    ax.set_ylim(bottom=0)
+
+    # Add value labels
+    for bar_group in bars:
+        for bar in bar_group:
+            height = bar.get_height()
+            if height > 0:
+                ax.text(bar.get_x() + bar.get_width()/2., height + 0.05,
+                        f'{height:.2f}x',
+                        ha='center', va='bottom', fontsize=8, fontweight='bold')
+
+    plt.tight_layout()
+
+    output_png = os.path.join(output_dir, "heuristic_comparison.png")
+    output_pdf = os.path.join(output_dir, "heuristic_comparison.pdf")
+    plt.savefig(output_png, dpi=300, bbox_inches='tight')
+    plt.savefig(output_pdf, bbox_inches='tight')
+
+    print("=" * 120)
+    print("RESULTS SUMMARY")
+    print("=" * 120)
+    header = f"{'Test Case':<20} {'Size':<10} {'Strategy':<15}"
+    for strategy in strategies:
+        header += f" {strategy_labels[strategy]:<18}"
+    header += f" {'Best':<10} {'Heuristic vs Best':<18}"
+    print(header)
+    print("-" * 120)
+
+    for r in all_results:
+        m, n = r['size']
+        best_strategy = None
+        best_value = 0
+        for strategy in strategies:
+            val = r.get(strategy)
+            if val is not None and val > best_value:
+                best_value = val
+                best_strategy = strategy
+
+        heuristic_val = r.get('heuristic')
+        heuristic_strategy = r.get('heuristic_strategy', 'N/A')
+
+        if heuristic_val is not None and best_value > 0:
+            diff_pct = ((heuristic_val - best_value) / best_value) * 100
+            diff_str = f"{diff_pct:+.1f}%"
+        else:
+            diff_str = "N/A"
+
+        row = f"{r['name']:<20} {m}x{n:<6} {heuristic_strategy:<15}"
+        for strategy in strategies:
+            val = r.get(strategy)
+            if val is not None:
+                row += f" {val:.2f}x{'':<14}"
+            else:
+                row += f" {'N/A':<18}"
+
+        best_label = strategy_labels[best_strategy] if best_strategy else "N/A"
+        row += f" {best_label:<10} {diff_str:<18}"
+        print(row)
+
+    print("-" * 120)
+    median_row = f"{'Median':<20} {'':<10} {'':<15}"
+    for strategy in strategies:
+        values = [r.get(strategy)
+                  for r in all_results if r.get(strategy) is not None]
+        if values:
+            median_val = np.median(values)
+            median_row += f" {median_val:.2f}x{'':<14}"
+        else:
+            median_row += f" {'N/A':<18}"
+
+    heuristic_vals = [r.get('heuristic')
+                      for r in all_results if r.get('heuristic') is not None]
+    best_vals = []
+    for r in all_results:
+        best_val = 0
+        for strategy in strategies:
+            val = r.get(strategy)
+            if val is not None and val > best_val:
+                best_val = val
+        if best_val > 0:
+            best_vals.append(best_val)
+
+    if heuristic_vals and best_vals and len(heuristic_vals) == len(best_vals):
+        median_heuristic = np.median(heuristic_vals)
+        median_best = np.median(best_vals)
+        median_diff = ((median_heuristic - median_best) / median_best) * 100
+        median_row += f" {'':<10} {median_diff:+.1f}%{'':<14}"
+    else:
+        median_row += f" {'':<10} {'N/A':<18}"
+
+    print(median_row)
+    print()
+    print(f"Chart saved to: {output_png}")
+    print(f"PDF saved to: {output_pdf}")
+
+    # Save results to JSON
+    results_json = os.path.join(
+        output_dir, "heuristic_comparison_results.json")
+    with open(results_json, 'w') as f:
+        json.dump({
+            "machine": machine_name,
+            "vector_isa": vector_isa,
+            "results": all_results,
+            "medians": {
+                strategy: float(np.median(
+                    [r.get(strategy) for r in all_results if r.get(strategy) is not None]))
+                if [r.get(strategy) for r in all_results if r.get(strategy) is not None] else None
+                for strategy in strategies
+            }
+        }, f, indent=2)
+    print(f"Results saved to: {results_json}")
+
+
+if __name__ == "__main__":
+    main()
