@@ -17,6 +17,12 @@
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 
+// Debug flag for strategy selection
+static llvm::cl::opt<bool> debugStrategyOpt(
+    "linalg-to-vector-debug-strategy",
+    llvm::cl::desc("Print debug information about strategy selection"),
+    llvm::cl::init(false));
+
 using namespace mlir;
 using namespace mlir::linalg;
 using namespace mlir::vector;
@@ -232,10 +238,62 @@ int64_t findOptimalUnrollingStride(int64_t remainder, int64_t vectorLen) {
   return 1; // Fallback to unroll one at a time
 }
 
+// Estimate instruction count for fully masked body with stride
+// This estimates the number of instructions that will be generated
+int64_t estimateMaskedBodyInstructions(int64_t m, int64_t n, int64_t k, int64_t stride) {
+  // Outer loop: m iterations
+  // Inner j loop: n/stride iterations (if stride divides n)
+  // Per j iteration:
+  //   - Mask creation: ~1 instruction
+  //   - K loop: k iterations
+  //     Per k iteration:
+  //       - Scalar load from A: ~1 instruction
+  //       - Broadcast: ~1 instruction
+  //       - Masked load from B: ~1 instruction
+  //       - FMA: ~1 instruction
+  //       - Yield: ~1 instruction
+  //   - Masked store: ~1 instruction
+  // Total per j iteration: 1 (mask) + k * 5 (k-loop body) + 1 (store) = 2 + 5*k
+  int64_t jIterations = n / stride; // stride divides n, so this is exact
+  return m * jIterations * (2 + 5 * k);
+}
+
+// Estimate instruction count for masked remainder approach
+int64_t estimateMaskedRemainderInstructions(int64_t m, int64_t n, int64_t k, int64_t vectorLen) {
+  int64_t remainder = n % vectorLen;
+  int64_t fullVectorIterations = n / vectorLen;
+  
+  // Main vectorized loop: m * fullVectorIterations iterations
+  // Per iteration:
+  //   - K loop: k iterations
+  //     Per k iteration:
+  //       - Scalar load: ~1
+  //       - Broadcast: ~1
+  //       - Vector load: ~1
+  //       - FMA: ~1
+  //       - Yield: ~1
+  //   - Vector store: ~1
+  // Total per main iteration: k * 5 + 1 = 5*k + 1
+  
+  // Remainder handling: m iterations
+  // Per remainder iteration:
+  //   - Mask creation: ~1
+  //   - K loop: k iterations (same as above)
+  //   - Masked store: ~1
+  // Total per remainder iteration: 1 + 5*k + 1 = 2 + 5*k
+  
+  int64_t mainLoopInstrs = m * fullVectorIterations * (5 * k + 1);
+  int64_t remainderInstrs = (remainder > 0) ? m * (2 + 5 * k) : 0;
+  
+  return mainLoopInstrs + remainderInstrs;
+}
+
 // Strategy function g(f(input)) - decides the best strategy
+// Now with instruction count estimation to choose optimal stride
 StrategyDecision determineStrategy(
     int64_t n, int64_t vectorLen, Type elementType,
-    bool hasMaskingCapability, bool hasStaticDims) {
+    bool hasMaskingCapability, bool hasStaticDims,
+    int64_t m = 0, int64_t k = 0) {
   
   StrategyDecision decision;
   InputWeights weights;
@@ -252,47 +310,41 @@ StrategyDecision determineStrategy(
     decision.useStride = false; // No stride needed - perfect alignment
     decision.cacheAligned = (getCacheLineStride(elementType, vectorLen) == vectorLen);
     decision.eliminatesRemainder = true;
+    
+    if (debugStrategyOpt) {
+      llvm::errs() << "[Strategy Debug] Selected: NO_MASKING (perfect tile, no remainder)\n";
+    }
     return decision;
   }
   
-  // Determine if masking is possible and beneficial
-  // Based on benchmark results: MASK_REMAINDER is almost always the best when masking is available
-  bool canMask = hasMaskingCapability;
-  double maskingBenefit = cost.maskingScore;
+  // Simplified heuristic based on AVX benchmark results:
+  // 1. If perfectly tiled (no remainder): Use NO_MASKING (already handled above)
+  // 2. If remainder == 1: Use UNROLL_REMAINDER (unrolling wins for remainder 1)
+  // 3. Otherwise: Use MASK_REMAINDER (masking wins for remainder 2, 3, etc.)
+  // Note: MASK_BODY is disabled in heuristic for now (code kept for future use)
   
-  // Decision logic (tuned based on performance results):
-  // 1. If masking is available, ALWAYS prefer MASK_REMAINDER (it consistently outperforms)
-  // 2. Only use MASK_BODY in very specific cases (perfect alignment, no remainder)
-  // 3. If masking not available, use unrolling
-  
-  if (canMask) {
-    // Masking is available - prefer MASK_REMAINDER (best performer in benchmarks)
-    // Only use MASK_BODY if we can eliminate remainder completely with a good stride
+  if (remainder == 1) {
+    // Remainder 1: Unrolling performs better on average
+    decision.strategy = StrategyDecision::UNROLL_REMAINDER;
+    decision.stride = findOptimalUnrollingStride(remainder, vectorLen);
+    decision.useStride = (decision.stride > 1);
+    decision.cacheAligned = false;
+    decision.eliminatesRemainder = false;
     
-    int64_t optimalStride;
-    bool cacheAligned, eliminatesRem;
-    optimalStride = findOptimalMaskingStride(n, vectorLen, elementType, cacheAligned, eliminatesRem);
+    if (debugStrategyOpt) {
+      llvm::errs() << "[Strategy Debug] Selected: UNROLL_REMAINDER (remainder=1, unrolling wins)\n";
+    }
+  } else if (hasMaskingCapability) {
+    // Remainder > 1: Masking performs better
+    decision.strategy = StrategyDecision::MASK_REMAINDER;
+    decision.stride = vectorLen; // Use full vector for main loop
+    decision.useStride = false;
+    decision.cacheAligned = false;
+    decision.eliminatesRemainder = false;
     
-    double remainderRatio = (double)remainder / vectorLen;
-    
-    // Very conservative: only use MASK_BODY if:
-    // - We can eliminate remainder AND it's cache-aligned, OR
-    // - No remainder at all (already handled above)
-    // Otherwise, use MASK_REMAINDER (which is consistently faster)
-    if (eliminatesRem && cacheAligned && remainderRatio == 0.0) {
-      // Perfect case: use fully masked body
-      decision.strategy = StrategyDecision::MASK_BODY;
-      decision.stride = optimalStride;
-      decision.useStride = true;
-      decision.cacheAligned = cacheAligned;
-      decision.eliminatesRemainder = eliminatesRem;
-    } else {
-      // Default: use masked remainder (best performer in benchmarks)
-      decision.strategy = StrategyDecision::MASK_REMAINDER;
-      decision.stride = vectorLen; // Use full vector for main loop
-      decision.useStride = false;
-      decision.cacheAligned = false;
-      decision.eliminatesRemainder = false;
+    if (debugStrategyOpt) {
+      llvm::errs() << "[Strategy Debug] Selected: MASK_REMAINDER (remainder=" << remainder 
+                   << ", masking wins)\n";
     }
   } else {
     // Masking not available, use unrolling
@@ -301,6 +353,10 @@ StrategyDecision determineStrategy(
     decision.useStride = (decision.stride > 1);
     decision.cacheAligned = false;
     decision.eliminatesRemainder = false;
+    
+    if (debugStrategyOpt) {
+      llvm::errs() << "[Strategy Debug] Selected: UNROLL_REMAINDER (masking not available)\n";
+    }
   }
   
   return decision;
@@ -353,13 +409,16 @@ struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
     
     // Determine strategy: use heuristic if enabled, otherwise use explicit flags
     StrategyDecision strategy;
-    bool hasMaskingCapability = (vectorWidthOpt >= 512); // AVX-512 has better masking
+    // AVX-512 has better masking, but AVX/AVX2 also support some masking
+    // For heuristic, we allow masking for all vector widths
+    bool hasMaskingCapability = (vectorWidthOpt >= 128); // AVX and above support masking
     
     if (useHeuristicStrategyOpt) {
       // Use heuristic system g(f(input))
       // Inputs: alignment/vector size, ISA masking capability, cache line size
+      // Pass m and k dimensions for accurate instruction counting
       strategy = determineStrategy(
-          n, vectorLen, elementType, hasMaskingCapability, hasStaticDims);
+          n, vectorLen, elementType, hasMaskingCapability, hasStaticDims, m, kDim);
     } else {
       // Use explicit flags (backward compatibility / blind strategies)
       strategy = StrategyDecision();
@@ -441,7 +500,7 @@ struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
     
     // TODO: remove this into a function? too much hassle though
     // Helper: scalar k-loop (with optional unrolling)
-    auto buildScalarK = [&](Value iIdx, Value jIdx) -> Value {
+    auto buildScalarK = [&](Value iIdx, Value jIdx, bool shouldUnrollK = false) -> Value {
       auto zeroVal = rewriter.create<arith::ConstantOp>(
           loc, elementType, rewriter.getZeroAttr(elementType));
 
@@ -460,8 +519,9 @@ struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
       };
 
       // Check if we can fully unroll (static K dimension and unroll enabled)
+      // Also enable if heuristic chose UNROLL_REMAINDER
       bool canFullyUnroll =
-          unrollScalarK && !lhsType.isDynamicDim(1) && kDim > 0;
+          (unrollScalarK || shouldUnrollK) && !lhsType.isDynamicDim(1) && kDim > 0;
 
       if (canFullyUnroll) {
         // Fully unrolling: generate explicit iterations for each k value
@@ -799,6 +859,8 @@ struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
       Value jRem = remLoop.getInductionVar();
       
       // Unroll stride iterations
+      // Enable k-loop unrolling if explicit flag is set OR heuristic chose UNROLL_REMAINDER
+      bool unrollK = unrollScalarK || (useHeuristicStrategyOpt && strategy.strategy == StrategyDecision::UNROLL_REMAINDER);
       for (int64_t offset = 0; offset < strategy.stride; offset++) {
         Value offsetConst = rewriter.create<arith::ConstantIndexOp>(loc, offset);
         Value jOffset = rewriter.create<arith::AddIOp>(loc, jRem, offsetConst);
@@ -807,16 +869,18 @@ struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
             loc, arith::CmpIPredicate::ult, jOffset, nConst);
         auto ifInBounds = rewriter.create<scf::IfOp>(loc, inBounds, false);
         rewriter.setInsertionPointToStart(ifInBounds.thenBlock());
-        Value finalScalar = buildScalarK(i, jOffset);
+        Value finalScalar = buildScalarK(i, jOffset, unrollK);
         rewriter.create<memref::StoreOp>(loc, finalScalar, result, ValueRange{i, jOffset});
         rewriter.setInsertionPointAfter(ifInBounds);
       }
     } else {
       // Standard scalar remainder loop
+      // Enable k-loop unrolling if explicit flag is set OR heuristic chose UNROLL_REMAINDER
+      bool unrollK = unrollScalarK || (useHeuristicStrategyOpt && strategy.strategy == StrategyDecision::UNROLL_REMAINDER);
       auto remLoop = rewriter.create<scf::ForOp>(loc, fullVectorCount, nConst, one);
       rewriter.setInsertionPointToStart(remLoop.getBody());
       Value jRem = remLoop.getInductionVar();
-      Value finalScalar = buildScalarK(i, jRem);
+      Value finalScalar = buildScalarK(i, jRem, unrollK);
       rewriter.create<memref::StoreOp>(loc, finalScalar, result, ValueRange{i, jRem});
     }
   erase_and_done:
