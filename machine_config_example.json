@@ -1,0 +1,19 @@
+{
+  "machines": {
+    "local": {
+      "type": "local",
+      "description": "Local machine",
+      "output_dir": "output/local"
+    },
+    "avx512": {
+      "type": "remote",
+      "description": "Remote AVX-512 machine",
+      "ssh_host": "user@address",
+      "ssh_key": "/path/to/key",
+      "remote_path": "/remote/path",
+      "llvm_project_path": "/llvm/project/path",
+      "output_dir": "output/avx512"
+    }
+  },
+  "default_machine": "local"
+}
