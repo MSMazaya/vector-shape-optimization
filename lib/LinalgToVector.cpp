@@ -302,6 +302,12 @@ StrategyDecision determineStrategy(
   int64_t remainder = n % vectorLen;
   bool hasRemainder = (remainder != 0);
   
+  // Get vector width to determine ISA (AVX vs AVX-512)
+  // Note: vectorWidthOpt is a global variable, we need to access it
+  // For now, we'll pass it as a parameter or check hasMaskingCapability
+  // AVX-512 typically has better masking, so we can infer from that
+  // But more accurately, we should check vectorWidthOpt >= 512
+  
   // If no remainder, use regular vector operations (no masking overhead)
   // Perfect tiles should not use masking - it adds unnecessary overhead
   if (!hasRemainder) {
@@ -317,14 +323,25 @@ StrategyDecision determineStrategy(
     return decision;
   }
   
-  // Simplified heuristic based on AVX benchmark results:
+  // Simplified heuristic based on AVX/AVX2/AVX-512 benchmark results:
   // 1. If perfectly tiled (no remainder): Use NO_MASKING (already handled above)
-  // 2. If remainder == 1: Use UNROLL_REMAINDER (unrolling wins for remainder 1)
-  // 3. Otherwise: Use MASK_REMAINDER (masking wins for remainder 2, 3, etc.)
+  // 2. For AVX (128 bits): If remainder == 1, use UNROLL_REMAINDER
+  // 3. For AVX2 (256 bits) and AVX-512 (512 bits): If remainder <= 3, use UNROLL_REMAINDER
+  // 4. Otherwise: Use MASK_REMAINDER (masking wins for larger remainders)
   // Note: MASK_BODY is disabled in heuristic for now (code kept for future use)
   
+  // Check if we should use unrolling based on remainder size and ISA
+  bool shouldUnroll = false;
   if (remainder == 1) {
-    // Remainder 1: Unrolling performs better on average
+    // Remainder 1: Unrolling performs better for AVX, AVX2, and AVX-512
+    shouldUnroll = true;
+  } else if (remainder <= 3 && vectorWidthOpt >= 256) {
+    // For AVX2 and AVX-512, unrolling wins for remainders 1-3
+    shouldUnroll = true;
+  }
+  
+  if (shouldUnroll) {
+    // Unrolling performs better for small remainders
     decision.strategy = StrategyDecision::UNROLL_REMAINDER;
     decision.stride = findOptimalUnrollingStride(remainder, vectorLen);
     decision.useStride = (decision.stride > 1);
@@ -332,7 +349,15 @@ StrategyDecision determineStrategy(
     decision.eliminatesRemainder = false;
     
     if (debugStrategyOpt) {
-      llvm::errs() << "[Strategy Debug] Selected: UNROLL_REMAINDER (remainder=1, unrolling wins)\n";
+      if (vectorWidthOpt >= 512) {
+        llvm::errs() << "[Strategy Debug] Selected: UNROLL_REMAINDER (remainder=" << remainder 
+                     << " <= 3, AVX-512 unrolling wins)\n";
+      } else if (vectorWidthOpt >= 256) {
+        llvm::errs() << "[Strategy Debug] Selected: UNROLL_REMAINDER (remainder=" << remainder 
+                     << " <= 3, AVX2 unrolling wins)\n";
+      } else {
+        llvm::errs() << "[Strategy Debug] Selected: UNROLL_REMAINDER (remainder=1, AVX unrolling wins)\n";
+      }
     }
   } else if (hasMaskingCapability) {
     // Remainder > 1: Masking performs better
@@ -851,16 +876,17 @@ struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
     
     if (shouldUseMaskedRemainder) {
       buildMaskedRemainder(i, fullVectorCount, nConst);
-    } else if (shouldUnrollRemainder && strategy.useStride && strategy.stride > 1) {
-      // Unroll remainder with optimal stride
+    } else if (shouldUnrollRemainder && strategy.useStride && strategy.stride > 1 && !useHeuristicStrategyOpt) {
+      // Unroll remainder with optimal stride (only for explicit flags, not heuristic)
+      // Note: Stride unrolling is disabled for heuristic in this stage
       auto strideConst = rewriter.create<arith::ConstantIndexOp>(loc, strategy.stride);
       auto remLoop = rewriter.create<scf::ForOp>(loc, fullVectorCount, nConst, strideConst);
       rewriter.setInsertionPointToStart(remLoop.getBody());
       Value jRem = remLoop.getInductionVar();
       
       // Unroll stride iterations
-      // Enable k-loop unrolling if explicit flag is set OR heuristic chose UNROLL_REMAINDER
-      bool unrollK = unrollScalarK || (useHeuristicStrategyOpt && strategy.strategy == StrategyDecision::UNROLL_REMAINDER);
+      // Enable k-loop unrolling if explicit flag is set
+      bool unrollK = unrollScalarK;
       for (int64_t offset = 0; offset < strategy.stride; offset++) {
         Value offsetConst = rewriter.create<arith::ConstantIndexOp>(loc, offset);
         Value jOffset = rewriter.create<arith::AddIOp>(loc, jRem, offsetConst);
