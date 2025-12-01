@@ -1,6 +1,7 @@
 add_mlir_library(MLIRVectorShapeOpt
   PrintLinalgOps.cpp
   LinalgToVector.cpp
+  SpeedupModelSimple.cpp
 
   LINK_LIBS PUBLIC
     MLIRIR

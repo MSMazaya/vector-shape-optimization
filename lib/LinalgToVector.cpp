@@ -73,6 +73,14 @@ static llvm::cl::opt<bool> useModelStrategyOpt(
     llvm::cl::desc("Use neural network model for strategy selection"),
     llvm::cl::init(false));
 
+// Use MLIR's generic linalg vectorizer (linalg::vectorize) instead of the
+// custom MatmulToVectorPattern. This provides an MLIR-baseline implementation
+// for linalg.matmul when enabled.
+static llvm::cl::opt<bool> useMlirVectorizerOpt(
+    "linalg-to-vector-use-mlir-vectorize",
+    llvm::cl::desc("Use MLIR linalg::vectorize helper for linalg.matmul"),
+    llvm::cl::init(false));
+
 // Calculate the vector length based on element type and vector width
 int64_t getVectorLength(Type elementType, int vectorWidthBits) {
   unsigned bitWidth = elementType.getIntOrFloatBitWidth();
@@ -403,6 +411,26 @@ struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
 
   LogicalResult matchAndRewrite(linalg::MatmulOp matmulOp,
                                 PatternRewriter &rewriter) const override {
+    // Optional MLIR baseline: delegate to the generic linalg vectorizer.
+    if (useMlirVectorizerOpt) {
+      Operation *op = matmulOp.getOperation();
+
+      // Quick pre-check: is there dedicated vectorization logic for this op?
+      if (!linalg::hasVectorizationImpl(op))
+        return failure();
+
+      // Check vectorization preconditions; no explicit vector sizes for now.
+      if (failed(linalg::vectorizeOpPrecondition(op)))
+        return failure();
+
+      auto resultOrErr = linalg::vectorize(rewriter, op);
+      if (failed(resultOrErr))
+        return failure();
+
+      rewriter.eraseOp(op);
+      return success();
+    }
+
     Location loc = matmulOp.getLoc();
 
     // Get operands
