@@ -1,4 +1,5 @@
 #include "my/Passes.h"
+#include "my/SpeedupModel.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -41,11 +42,12 @@ static llvm::cl::opt<bool> useMaskedRemainderOpt(
     llvm::cl::desc("Use masked vector operations for remainder handling"),
     llvm::cl::init(false));
 
-static llvm::cl::opt<bool> useFullyMaskedOpt(
-  "linalg-to-vector-fully-masked",
-  llvm::cl::desc("Use fully masked method"),
-  llvm::cl::init(false)
-);
+// Body masking stride option (LS: Logical Size)
+// When LS < VS, body is masked with stride LS. Remainder handling is independent.
+static llvm::cl::opt<int> bodyMaskingStrideOpt(
+    "linalg-to-vector-body-masking-stride",
+    llvm::cl::desc("Body masking stride (LS) in elements. When LS < VS, body is masked with stride LS. Remainder handling is independent (use --linalg-to-vector-use-masked-remainder or --linalg-to-vector-unroll-scalar-k)."),
+    llvm::cl::init(0));
 
 // Vector width option (128 for AVX, 512 for AVX-512)
 static llvm::cl::opt<int> vectorWidthOpt(
@@ -53,22 +55,22 @@ static llvm::cl::opt<int> vectorWidthOpt(
     llvm::cl::desc("Vector width in bits (128 for AVX, 512 for AVX-512)"),
     llvm::cl::init(128));
 
-// Stride option for fully masked mode
-static llvm::cl::opt<int> maskedStrideOpt(
-    "linalg-to-vector-masked-stride",
-    llvm::cl::desc("Stride for fully masked mode (in elements). If specified and leaves no remainder, use it; otherwise use max hardware size."),
-    llvm::cl::init(0));
-
-// Cache line size option for fully masked mode
+// Cache line size option for body masking stride heuristic
 static llvm::cl::opt<bool> useCacheLineStrideOpt(
     "linalg-to-vector-use-cache-line-stride",
-    llvm::cl::desc("Use cache line size (64 bytes) as stride heuristic for fully masked mode"),
+    llvm::cl::desc("Use cache line size (64 bytes) as stride heuristic for body masking"),
     llvm::cl::init(false));
 
 // Heuristic-based strategy selection
 static llvm::cl::opt<bool> useHeuristicStrategyOpt(
     "linalg-to-vector-use-heuristic",
     llvm::cl::desc("Use heuristic-based strategy selection (g(f(input))) instead of explicit flags"),
+    llvm::cl::init(false));
+
+// Model-based strategy selection using neural network
+static llvm::cl::opt<bool> useModelStrategyOpt(
+    "linalg-to-vector-use-model",
+    llvm::cl::desc("Use neural network model for strategy selection"),
     llvm::cl::init(false));
 
 // Calculate the vector length based on element type and vector width
@@ -389,11 +391,11 @@ StrategyDecision determineStrategy(
 
 // Pattern to convert MatmulOp to vector operations
 struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
-  MatmulToVectorPattern(MLIRContext *context, bool unrollScalarK, bool useMaskedRemainder, bool useFullyMasked)
+  MatmulToVectorPattern(MLIRContext *context, bool unrollScalarK, bool useMaskedRemainder, bool useBodyMasking)
       : OpRewritePattern<linalg::MatmulOp>(context),
         unrollScalarK(unrollScalarK),
         useMaskedRemainder(useMaskedRemainder),
-        useFullyMasked(useFullyMasked) {}
+        useFullyMasked(useBodyMasking) {}  // Keep internal name for now to minimize changes
 
   bool unrollScalarK;
   bool useMaskedRemainder;
@@ -438,7 +440,137 @@ struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
     // For heuristic, we allow masking for all vector widths
     bool hasMaskingCapability = (vectorWidthOpt >= 128); // AVX and above support masking
     
-    if (useHeuristicStrategyOpt) {
+    if (useModelStrategyOpt) {
+      // Use neural network model for strategy selection
+      // Generate all possible (LS, remainder_strategy) combinations and pick best
+      StrategyDecision best_strategy;
+      float best_speedup = 0.0f;
+      
+      // Determine instruction type from vector width
+      int instruction_type = 1; // Default AVX
+      if (vectorWidthOpt >= 512) {
+        instruction_type = 3; // AVX512
+      } else if (vectorWidthOpt >= 256) {
+        instruction_type = 2; // AVX2
+      }
+      
+      // X * Y (repetition dimensions): For matmul, X = m, Y = 1
+      int64_t X_times_Y = m;
+      
+      // K (vectorized dimension size) = n
+      int64_t K = n;
+      
+      if (debugStrategyOpt) {
+        llvm::errs() << "[Model Strategy] Evaluating configurations:\n";
+        llvm::errs() << "  instruction_type=" << instruction_type 
+                     << ", K=" << K << ", X_times_Y=" << X_times_Y << "\n";
+      }
+      
+      // Track best configuration details
+      int64_t best_LS = vectorLen;
+      int64_t best_remainder_strategy = 0;
+      
+      // Generate all possible configurations
+      for (int64_t LS = 1; LS <= vectorLen; ++LS) {
+        int64_t LS_equals_VS = (LS == vectorLen) ? 1 : 0;
+        int64_t K_remainder = K % LS;  // Numeric remainder, not binary
+        int64_t LS_div_K = (K > 0) ? (LS / K) : 0;  // LS // K
+        
+        // Test both remainder strategies (masking=0, unrolling=1)
+        for (int64_t remainder_strategy = 0; remainder_strategy <= 1; ++remainder_strategy) {
+          // Predict speedup for this configuration
+          float predicted_speedup = predictSpeedupFromFeatures(
+            instruction_type, LS, LS_equals_VS, K_remainder,
+            remainder_strategy, X_times_Y, LS_div_K
+          );
+          
+          if (debugStrategyOpt) {
+            llvm::errs() << "  LS=" << LS 
+                         << ", remainder_strategy=" << (remainder_strategy == 0 ? "masking" : "unrolling")
+                         << ", predicted_speedup=" << predicted_speedup << "x\n";
+          }
+          
+          // Keep track of best
+          if (predicted_speedup > best_speedup) {
+            best_speedup = predicted_speedup;
+            best_LS = LS;
+            best_remainder_strategy = remainder_strategy;
+            
+            // Map to StrategyDecision
+            // LS = Logical Size (masking stride for body)
+            // VS = Vector Size (vectorLen)
+            // When LS < VS: Body is masked with stride LS, remainder still needs handling
+            // remainder_strategy: 0=masking, 1=unrolling for the remainder part
+            if (K_remainder == 0 && LS == vectorLen) {
+              // Perfect alignment (K % LS == 0) and using full vector width - no masking needed
+              best_strategy.strategy = StrategyDecision::NO_MASKING;
+              best_strategy.stride = vectorLen;
+              best_strategy.useStride = false;
+              best_strategy.eliminatesRemainder = true;
+            } else if (LS < vectorLen) {
+              // LS < VS: Body is masked with stride LS (MASK_BODY)
+              // Remainder handling depends on remainder_strategy:
+              // - remainder_strategy=0: mask the remainder too (fully masked)
+              // - remainder_strategy=1: unroll the remainder
+              best_strategy.strategy = StrategyDecision::MASK_BODY;
+              best_strategy.stride = LS;
+              best_strategy.useStride = true;
+              best_strategy.eliminatesRemainder = (K % LS == 0);
+              // Store remainder strategy info: we'll use MASK_BODY and handle remainder
+              // The remainder_strategy is already captured in best_remainder_strategy
+            } else if (LS == vectorLen && remainder_strategy == 0) {
+              // LS == VS with masking means mask only the remainder - this is MASK_REMAINDER
+              best_strategy.strategy = StrategyDecision::MASK_REMAINDER;
+              best_strategy.stride = vectorLen;
+              best_strategy.useStride = false;
+              best_strategy.eliminatesRemainder = false;
+            } else {
+              // LS == VS with unrolling: unroll the remainder
+              best_strategy.strategy = StrategyDecision::UNROLL_REMAINDER;
+              best_strategy.stride = vectorLen;
+              best_strategy.useStride = false;
+              best_strategy.eliminatesRemainder = false;
+            }
+            
+            // Check cache alignment
+            int64_t cacheLineStride = getCacheLineStride(elementType, vectorLen);
+            best_strategy.cacheAligned = (LS == cacheLineStride);
+          }
+        }
+      }
+      
+      strategy = best_strategy;
+      
+      if (debugStrategyOpt) {
+        const char* strategy_name = "UNKNOWN";
+        switch (best_strategy.strategy) {
+          case StrategyDecision::NO_MASKING:
+            strategy_name = "NO_MASKING";
+            break;
+          case StrategyDecision::MASK_REMAINDER:
+            strategy_name = "MASK_REMAINDER";
+            break;
+          case StrategyDecision::UNROLL_REMAINDER:
+            strategy_name = "UNROLL_REMAINDER";
+            break;
+          case StrategyDecision::MASK_BODY:
+            strategy_name = "MASK_BODY";
+            break;
+        }
+        const char* remainder_strategy_name = (best_remainder_strategy == 0) ? "masking" : "unrolling";
+        llvm::errs() << "[Model Strategy] Selected: " << strategy_name;
+        
+        if (best_LS < vectorLen) {
+          // LS < VS: Body is masked with stride LS, remainder handled separately
+          llvm::errs() << " (body_masked=true, body_stride=LS=" << best_LS
+                       << ", remainder=" << remainder_strategy_name << ")";
+        } else {
+          // LS == VS: No body masking, only remainder handling
+          llvm::errs() << " (body_masked=false, remainder=" << remainder_strategy_name << ")";
+        }
+        llvm::errs() << " [predicted_speedup=" << best_speedup << "x]\n";
+      }
+    } else if (useHeuristicStrategyOpt) {
       // Use heuristic system g(f(input))
       // Inputs: alignment/vector size, ISA masking capability, cache line size
       // Pass m and k dimensions for accurate instruction counting
@@ -447,9 +579,11 @@ struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
     } else {
       // Use explicit flags (backward compatibility / blind strategies)
       strategy = StrategyDecision();
-      if (useFullyMasked) {
+      // Check if body masking stride is set via explicit flags
+      int64_t bodyStride = bodyMaskingStrideOpt;
+      if (bodyStride > 0 && bodyStride < vectorLen) {
         strategy.strategy = StrategyDecision::MASK_BODY;
-        strategy.stride = vectorLen;
+        strategy.stride = bodyStride;
         strategy.useStride = false;
       } else if (useMaskedRemainder) {
         strategy.strategy = StrategyDecision::MASK_REMAINDER;
@@ -579,14 +713,19 @@ struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
 
     // Main vectorized loops:
     // Use heuristic-determined strategy, or fall back to explicit flags
-    bool shouldUseFullyMasked = (strategy.strategy == StrategyDecision::MASK_BODY) || useFullyMasked;
+    // Body masking is used when body masking stride is set AND LS < VS
+    // If LS == VS, it's no masking (use full vector width)
+    // Note: body masking stride and remainder handling are independent
+    int64_t bodyStride = bodyMaskingStrideOpt;
+    bool shouldUseBodyMasking = (strategy.strategy == StrategyDecision::MASK_BODY) || 
+                               (bodyStride > 0 && bodyStride < vectorLen);
     bool shouldUseNoMasking = (strategy.strategy == StrategyDecision::NO_MASKING);
     
     // For perfect tiles (no remainder), use regular vector operations without masking
     if (shouldUseNoMasking) {
       // Skip the fully masked path and go straight to regular vectorized loops below
       // This avoids masking overhead for perfect tiles
-    } else if (shouldUseFullyMasked) {
+    } else if (shouldUseBodyMasking) {
       // Use heuristic-determined stride, or override with explicit options
       int64_t effectiveStride = strategy.useStride ? strategy.stride : vectorLen;
       bool useCustomStride = strategy.useStride;
@@ -597,16 +736,25 @@ struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
         cacheLineStride = getCacheLineStride(elementType, vectorLen);
       }
       
-      if (maskedStrideOpt > 0) {
-        if (hasStaticDims) {
-          if (n % maskedStrideOpt == 0 && maskedStrideOpt <= vectorLen) {
-            effectiveStride = maskedStrideOpt;
-            useCustomStride = true;
+      // Get body masking stride (LS) - check both new and legacy option names
+      int64_t bodyStride = bodyMaskingStrideOpt;
+      
+      if (bodyStride > 0) {
+        // When LS < VS: Body is masked with stride LS
+        // Remainder handling is independent (handled separately below)
+        if (bodyStride <= vectorLen) {
+          effectiveStride = bodyStride;
+          useCustomStride = true;
+          
+          if (debugStrategyOpt) {
+            llvm::errs() << "[Body Masking] Using body stride LS=" << bodyStride 
+                         << " (VS=" << vectorLen << ", n=" << n 
+                         << ", remainder=" << (n % bodyStride) << ")\n";
           }
         } else {
-          if (maskedStrideOpt <= vectorLen) {
-            effectiveStride = maskedStrideOpt;
-            useCustomStride = true;
+          if (debugStrategyOpt) {
+            llvm::errs() << "[Body Masking] Warning: bodyStride=" << bodyStride 
+                         << " > VS=" << vectorLen << ", ignoring\n";
           }
         }
       } else if (useCacheLineStrideOpt && cacheLineStride > 0) {
@@ -644,8 +792,9 @@ struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
         if (!hasStaticDims) {
           Value strideCandidate = vectorLenConst;
           
-          if (maskedStrideOpt > 0 && maskedStrideOpt <= vectorLen) {
-            strideCandidate = rewriter.create<arith::ConstantIndexOp>(loc, maskedStrideOpt);
+          int64_t bodyStride = bodyMaskingStrideOpt;
+          if (bodyStride > 0 && bodyStride <= vectorLen) {
+            strideCandidate = rewriter.create<arith::ConstantIndexOp>(loc, bodyStride);
           } else if (useCacheLineStrideOpt && cacheLineStride > 0 && cacheLineStride <= vectorLen) {
             strideCandidate = rewriter.create<arith::ConstantIndexOp>(loc, cacheLineStride);
           }
@@ -667,59 +816,98 @@ struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
       rewriter.setInsertionPointToStart(outerLoopI.getBody());
       Value i = outerLoopI.getInductionVar();
       
-      // Single J-loop with masking for every iteration
-      // Use final stride for loop increment
-      auto jLoop = rewriter.create<scf::ForOp>(loc, zero, nConst, finalStride);
-      rewriter.setInsertionPointToStart(jLoop.getBody());
-      Value j = jLoop.getInductionVar();
+      // When LS < VS: Split into BODY loop (masked with stride LS) and REMAINDER loop (handled separately)
+      // Calculate body loop end: (n / LS) * LS (no remainder)
+      Value bodyLoopEnd;
+      if (hasStaticDims && useCustomStride) {
+        int64_t bodyLoopEndStatic = (n / effectiveStride) * effectiveStride;
+        bodyLoopEnd = rewriter.create<arith::ConstantIndexOp>(loc, bodyLoopEndStatic);
+      } else {
+        // Dynamic: bodyLoopEnd = (n / finalStride) * finalStride
+        auto nDivStride = rewriter.create<arith::DivUIOp>(loc, nConst, finalStride);
+        bodyLoopEnd = rewriter.create<arith::MulIOp>(loc, nDivStride, finalStride);
+      }
       
-      // Calculate active elements: min(finalStride, n - j)
-      Value remainingElements = rewriter.create<arith::SubIOp>(loc, nConst, j);
-      Value activeCount = rewriter.create<arith::MinSIOp>(loc, finalStride, remainingElements);
+      // BODY LOOP: From 0 to bodyLoopEnd with step LS (all fully masked, no remainder)
+      auto bodyLoop = rewriter.create<scf::ForOp>(loc, zero, bodyLoopEnd, finalStride);
+      rewriter.setInsertionPointToStart(bodyLoop.getBody());
+      Value jBody = bodyLoop.getInductionVar();
       
-      // Create mask - use effective vector type size
-      // For static dimensions with custom stride, use effectiveStride
-      // For dynamic or default case, use vectorLen (hardware max)
-      auto maskType = hasStaticDims && useCustomStride 
+      // Body loop: always fully masked with stride LS (no remainder to handle)
+      auto maskTypeBody = hasStaticDims && useCustomStride 
           ? VectorType::get({effectiveStride}, rewriter.getI1Type())
           : VectorType::get({vectorLen}, rewriter.getI1Type());
-      Value mask = rewriter.create<vector::CreateMaskOp>(loc, maskType, activeCount);
+      // Create full mask (all elements active in body)
+      Value fullMaskCount = finalStride;
+      Value maskBody = rewriter.create<vector::CreateMaskOp>(loc, maskTypeBody, fullMaskCount);
       
       // Zero vector with effective vector type
       auto zeroElement = rewriter.create<arith::ConstantOp>(
           loc, elementType, rewriter.getZeroAttr(elementType));
       auto zeroVec = rewriter.create<vector::BroadcastOp>(loc, effectiveVectorType, zeroElement);
       
-      // K-loop
-      SmallVector<Value> initArgs{zeroVec};
-      auto kLoop = rewriter.create<scf::ForOp>(loc, zero, kConst, one, initArgs);
-      rewriter.setInsertionPointToStart(kLoop.getBody());
-      Value k = kLoop.getInductionVar();
-      Value accVec = kLoop.getBody()->getArgument(1);
+      // K-loop for body
+      SmallVector<Value> initArgsBody{zeroVec};
+      auto kLoopBody = rewriter.create<scf::ForOp>(loc, zero, kConst, one, initArgsBody);
+      rewriter.setInsertionPointToStart(kLoopBody.getBody());
+      Value kBody = kLoopBody.getInductionVar();
+      Value accVecBody = kLoopBody.getBody()->getArgument(1);
       
       // Load and broadcast A[i,k]
-      SmallVector<Value> lhsIdx{i, k};
-      auto aScalar = rewriter.create<memref::LoadOp>(loc, elementType, lhs, lhsIdx);
-      auto aVec = rewriter.create<vector::BroadcastOp>(loc, effectiveVectorType, aScalar);
+      SmallVector<Value> lhsIdx{i, kBody};
+      auto aScalarBody = rewriter.create<memref::LoadOp>(loc, elementType, lhs, lhsIdx);
+      auto aVecBody = rewriter.create<vector::BroadcastOp>(loc, effectiveVectorType, aScalarBody);
       
-      // Masked load B[k, j:j+finalStride]
-      SmallVector<Value> rhsIdx{k, j};
-      auto bVec = rewriter.create<vector::MaskedLoadOp>(
-          loc, effectiveVectorType, rhs, rhsIdx, mask, zeroVec);
+      // Masked load B[k, j:j+finalStride] (full mask in body)
+      SmallVector<Value> rhsIdx{kBody, jBody};
+      auto bVecBody = rewriter.create<vector::MaskedLoadOp>(
+          loc, effectiveVectorType, rhs, rhsIdx, maskBody, zeroVec);
       
       // FMA
-      auto fmaResult = rewriter.create<vector::FMAOp>(loc, effectiveVectorType, aVec, bVec, accVec);
-      rewriter.create<scf::YieldOp>(loc, ValueRange{fmaResult.getResult()});
+      auto fmaResultBody = rewriter.create<vector::FMAOp>(loc, effectiveVectorType, aVecBody, bVecBody, accVecBody);
+      rewriter.create<scf::YieldOp>(loc, ValueRange{fmaResultBody.getResult()});
       
       // Masked store
-      rewriter.setInsertionPointAfter(kLoop);
-      Value finalVec = kLoop.getResults()[0];
-      SmallVector<Value> resultIdx{i, j};
-      rewriter.create<vector::MaskedStoreOp>(loc, result, resultIdx, mask, finalVec);
+      rewriter.setInsertionPointAfter(kLoopBody);
+      Value finalVecBody = kLoopBody.getResults()[0];
+      SmallVector<Value> resultIdxBody{i, jBody};
+      rewriter.create<vector::MaskedStoreOp>(loc, result, resultIdxBody, maskBody, finalVecBody);
       
-      // jLoop doesn't need a yield since it has no iter_args
-      // Just move insertion point after it
-      rewriter.setInsertionPointAfter(jLoop);
+      // Move insertion point after body loop
+      rewriter.setInsertionPointAfter(bodyLoop);
+      
+      // REMAINDER LOOP: From bodyLoopEnd to n (handled separately based on remainder_strategy)
+      // Check if there's a remainder
+      bool hasRemainderAtCompileTime = hasStaticDims && (n % effectiveStride != 0);
+      if (hasRemainderAtCompileTime || !hasStaticDims) {
+        // Determine remainder handling strategy
+        bool shouldUseMaskedRemainder = useMaskedRemainderOpt;
+        bool shouldUnrollRemainder = unrollScalarKOpt && !shouldUseMaskedRemainder;
+        
+        if (debugStrategyOpt && hasStaticDims) {
+          int64_t remainder = n % effectiveStride;
+          const char* remainderMethod = shouldUnrollRemainder ? "unrolling" : 
+                                       (shouldUseMaskedRemainder ? "masking" : "masking (default)");
+          llvm::errs() << "[Body Masking] Body loop: 0 to " << (n / effectiveStride) * effectiveStride 
+                       << " step " << effectiveStride << " (fully masked)\n";
+          llvm::errs() << "[Body Masking] Remainder: " << (n / effectiveStride) * effectiveStride 
+                       << " to " << n << " (remainder=" << remainder 
+                       << ", handled by " << remainderMethod << ")\n";
+        }
+        
+        if (shouldUseMaskedRemainder) {
+          // Masked remainder: use buildMaskedRemainder helper
+          buildMaskedRemainder(i, bodyLoopEnd, nConst);
+        } else {
+          // Unrolled remainder: scalar loop
+          bool unrollK = unrollScalarKOpt;
+          auto remLoop = rewriter.create<scf::ForOp>(loc, bodyLoopEnd, nConst, one);
+          rewriter.setInsertionPointToStart(remLoop.getBody());
+          Value jRem = remLoop.getInductionVar();
+          Value finalScalar = buildScalarK(i, jRem, unrollK);
+          rewriter.create<memref::StoreOp>(loc, finalScalar, result, ValueRange{i, jRem});
+        }
+      }
       
       // outerLoopI also doesn't need a yield since it has no iter_args
       rewriter.setInsertionPointAfter(outerLoopI);
@@ -946,9 +1134,14 @@ struct LinalgToVectorPass
         unrollScalarKOpt || (getenv("UNROLL_REMAINDER") != nullptr);
     bool useMaskedRemainder = useMaskedRemainderOpt ||
         (getenv("USE_MASKED_REMAINDER") != nullptr);
-    bool useFullyMasked = useFullyMaskedOpt;
+    // Body masking is used if body masking stride is set AND LS < VS
+    // Body masking and remainder handling are independent
+    // Note: We can't check vectorLen here without element type, so we check in the pattern
+    // If bodyStride > 0, the pattern will check if it's < VS
+    int64_t bodyStride = bodyMaskingStrideOpt;
+    bool useBodyMasking = (bodyStride > 0);
         
-    patterns.add<MatmulToVectorPattern>(context, shouldUnroll, useMaskedRemainder, useFullyMasked);
+    patterns.add<MatmulToVectorPattern>(context, shouldUnroll, useMaskedRemainder, useBodyMasking);
 
     if (failed(applyPatternsAndFoldGreedily(func, std::move(patterns)))) {
       signalPassFailure();
