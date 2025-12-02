@@ -256,6 +256,9 @@ def compile_and_benchmark(test_file, vector_isa, strategy_type, num_runs=100, ll
         elif strategy_type == "heuristic":
             vector_opt_cmd.append("--linalg-to-vector-use-heuristic")
             vector_opt_cmd.append("--linalg-to-vector-debug-strategy")
+        elif strategy_type == "model":
+            vector_opt_cmd.append("--linalg-to-vector-use-model")
+            vector_opt_cmd.append("--linalg-to-vector-debug-strategy")
 
         result = subprocess.run(
             vector_opt_cmd + [preprocessed_file],
@@ -266,7 +269,7 @@ def compile_and_benchmark(test_file, vector_isa, strategy_type, num_runs=100, ll
         )
 
         chosen_strategy = None
-        if strategy_type == "heuristic" and result.stderr:
+        if strategy_type in ["heuristic", "model"] and result.stderr:
             for line in result.stderr.split('\n'):
                 if "[Strategy Debug] Selected:" in line:
                     if "NO_MASKING" in line:
@@ -516,7 +519,7 @@ int main() {{
 def run_benchmark_local(test_file, vector_isa, num_runs=100, llvm_path_override=None):
     """Run all strategies locally."""
     strategies = ["scalar_remainder", "unrolled_remainder",
-                  "masked_remainder", "heuristic"]
+                  "masked_remainder", "heuristic", "model"]
     results = {}
     heuristic_strategy = None
 
@@ -525,11 +528,12 @@ def run_benchmark_local(test_file, vector_isa, num_runs=100, llvm_path_override=
         result = compile_and_benchmark(
             test_file, vector_isa, strategy, num_runs, llvm_path_override)
 
-        if strategy == "heuristic":
+        if strategy in ["heuristic", "model"]:
             if result and result[0] is not None:
                 speedup, chosen_strategy = result
                 results[strategy] = speedup
-                heuristic_strategy = chosen_strategy
+                if strategy == "heuristic":
+                    heuristic_strategy = chosen_strategy
                 print(
                     f"    Speedup: {speedup:.2f}x (chose: {chosen_strategy})")
             else:
@@ -545,8 +549,455 @@ def run_benchmark_local(test_file, vector_isa, num_runs=100, llvm_path_override=
     return results, heuristic_strategy
 
 
-def run_benchmark_remote(test_file, vector_isa, machine_config, num_runs=100):
-    """Run all strategies on remote machine via SSH."""
+def cross_compile_and_benchmark_remote(test_file, vector_isa, machine_config, num_runs=100):
+    """Cross-compile locally and run benchmarks on remote ARM machine."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    llvm_path = os.environ.get('LLVM_PROJECT_PATH',
+                               '/home/mazaya/Documents/cmu/interviews/vorticity/llvm-project-vorticity')
+    
+    ssh_host = machine_config["ssh_host"]
+    ssh_key = machine_config.get("ssh_key", "")
+    remote_path = machine_config["remote_path"]
+    
+    # Set compilation flags for ARM
+    if vector_isa == "sve":
+        llc_attrs = "-mattr=+sve"
+        vector_width_flag = "--linalg-to-vector-vector-width=256"
+        llc_march = "aarch64"
+    elif vector_isa == "sme":
+        llc_attrs = "-mattr=+sme,+sve"
+        vector_width_flag = "--linalg-to-vector-vector-width=256"
+        llc_march = "aarch64"
+    else:
+        # For non-ARM, use old method
+        return run_benchmark_remote_old(test_file, vector_isa, machine_config, num_runs)
+    
+    test_file_abs = os.path.abspath(test_file)
+    test_file_name = os.path.basename(test_file)
+    
+    print(f"  Cross-compiling {test_file_name} locally for ARM...")
+    
+    # Read test file
+    with open(test_file, 'r') as f:
+        content = f.read()
+        func_match = re.search(r'func\.func @(\w+)', content)
+        func_name = func_match.group(1) if func_match else "matmul"
+        
+        if 'f64' in content or 'double' in content:
+            c_type = 'double'
+            alignment = 64
+        else:
+            c_type = 'float'
+            alignment = 32
+    
+    dims = get_matrix_size(test_file)
+    if not dims:
+        return {}, None
+    m, n = dims
+    
+    temp_dir = tempfile.mkdtemp()
+    strategies = ["scalar_remainder", "unrolled_remainder", "masked_remainder", "heuristic", "model"]
+    results = {}
+    heuristic_strategy = None
+    
+    try:
+        # Preprocess test file
+        preprocessed_file = os.path.join(temp_dir, "preprocessed.mlir")
+        with open(test_file, 'r') as f_in:
+            content = f_in.read()
+        if 'func.return' not in content:
+            content = re.sub(r'(?<!func\.)\breturn\b', 'func.return', content)
+        if 'module {' not in content:
+            content = f"module {{\n{content}\n}}\n"
+        with open(preprocessed_file, 'w') as f_out:
+            f_out.write(content)
+        
+        # Compile each strategy
+        executables = {}
+        for strategy in strategies:
+            print(f"    Compiling {strategy}...")
+            strategy_dir = os.path.join(temp_dir, strategy)
+            os.makedirs(strategy_dir, exist_ok=True)
+            
+            # Track if this strategy compilation succeeded
+            strategy_succeeded = False
+            
+            # Run vector-shape-opt
+            vector_opt_cmd = [
+                f"{script_dir}/build/tools/vector-shape-opt/vector-shape-opt",
+                "--linalg-to-vector",
+                vector_width_flag
+            ]
+            
+            if strategy == "unrolled_remainder":
+                vector_opt_cmd.append("--linalg-to-vector-unroll-scalar-k")
+            elif strategy == "masked_remainder":
+                vector_opt_cmd.append("--linalg-to-vector-use-masked-remainder")
+            elif strategy == "heuristic":
+                vector_opt_cmd.append("--linalg-to-vector-use-heuristic")
+                vector_opt_cmd.append("--linalg-to-vector-debug-strategy")
+            elif strategy == "model":
+                vector_opt_cmd.append("--linalg-to-vector-use-model")
+                vector_opt_cmd.append("--linalg-to-vector-debug-strategy")
+            
+            result = subprocess.run(
+                vector_opt_cmd + [preprocessed_file],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False
+            )
+            
+            if result.returncode != 0:
+                print(f"      Error compiling {strategy}: {result.stderr[:500]}")
+                if strategy == "model":
+                    print(f"      Model compilation failed - check if model is properly integrated")
+                    print(f"      Full stderr: {result.stderr}")
+                # Remove the directory if compilation failed
+                if os.path.exists(strategy_dir):
+                    shutil.rmtree(strategy_dir, ignore_errors=True)
+                continue
+            
+            # Extract strategy choice for heuristic/model
+            if strategy in ["heuristic", "model"] and result.stderr:
+                for line in result.stderr.split('\n'):
+                    if "[Strategy Debug] Selected:" in line:
+                        if "NO_MASKING" in line:
+                            heuristic_strategy = "NO_MASKING"
+                        elif "UNROLL_REMAINDER" in line:
+                            heuristic_strategy = "UNROLL_REMAINDER"
+                        elif "MASK_REMAINDER" in line:
+                            heuristic_strategy = "MASK_REMAINDER"
+                        elif "MASK_BODY" in line:
+                            heuristic_strategy = "MASK_BODY"
+                        break
+            
+            vectorized_mlir = os.path.join(strategy_dir, "vectorized.mlir")
+            with open(vectorized_mlir, 'w') as f:
+                f.write(result.stdout)
+            
+            # Lower to LLVM IR
+            vectorized_lowered = os.path.join(strategy_dir, "vectorized_lowered.mlir")
+            vectorized_ll = os.path.join(strategy_dir, "vectorized.ll")
+            
+            subprocess.run([
+                f"{llvm_path}/build/bin/mlir-opt",
+                vectorized_mlir,
+                "--memref-expand",
+                "--finalize-memref-to-llvm",
+                "--convert-vector-to-llvm",
+                "--convert-scf-to-cf",
+                "--convert-cf-to-llvm",
+                "--convert-func-to-llvm",
+                "--convert-arith-to-llvm",
+                "--reconcile-unrealized-casts",
+                "-o", vectorized_lowered
+            ], capture_output=True, check=True)
+            
+            # Rename function
+            with open(vectorized_lowered, 'r') as f:
+                content = f.read()
+            content = content.replace(f"@{func_name}", f"@vectorized_{func_name}")
+            with open(vectorized_lowered, 'w') as f:
+                f.write(content)
+            
+            subprocess.run([
+                f"{llvm_path}/build/bin/mlir-translate",
+                "--mlir-to-llvmir",
+                vectorized_lowered,
+                "-o", vectorized_ll
+            ], capture_output=True, check=True)
+            
+            # Cross-compile to ARM object file
+            vectorized_o = os.path.join(strategy_dir, "vectorized.o")
+            subprocess.run([
+                f"{llvm_path}/build/bin/llc",
+                f"-march={llc_march}",
+                llc_attrs,
+                "-O3",
+                "-filetype=obj",
+                vectorized_ll,
+                "-o", vectorized_o
+            ], capture_output=True, check=True)
+            
+            # Also compile scalar version
+            scalar_mlir = os.path.join(strategy_dir, "scalar.mlir")
+            scalar_ll = os.path.join(strategy_dir, "scalar.ll")
+            scalar_o = os.path.join(strategy_dir, "scalar.o")
+            
+            subprocess.run([
+                f"{llvm_path}/build/bin/mlir-opt",
+                preprocessed_file,
+                "--linalg-generalize-named-ops",
+                "--convert-linalg-to-loops",
+                "--convert-scf-to-cf",
+                "--convert-cf-to-llvm",
+                "--convert-func-to-llvm",
+                "--memref-expand",
+                "--finalize-memref-to-llvm",
+                "--convert-arith-to-llvm",
+                "--reconcile-unrealized-casts",
+                "-o", scalar_mlir
+            ], capture_output=True, check=True)
+            
+            subprocess.run([
+                f"{llvm_path}/build/bin/mlir-translate",
+                "--mlir-to-llvmir",
+                scalar_mlir,
+                "-o", scalar_ll
+            ], capture_output=True, check=True)
+            
+            subprocess.run([
+                f"{llvm_path}/build/bin/llc",
+                f"-march={llc_march}",
+                "-O3",
+                "-filetype=obj",
+                scalar_ll,
+                "-o", scalar_o
+            ], capture_output=True, check=True)
+            
+            # Create wrapper
+            wrapper_c = os.path.join(strategy_dir, "wrapper.c")
+            with open(wrapper_c, 'w') as f:
+                f.write(f"""
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <math.h>
+
+void {func_name}({c_type}* alloc, {c_type}* aligned, int64_t offset, int64_t size0, int64_t size1, int64_t stride0, int64_t stride1,
+                 {c_type}* alloc2, {c_type}* aligned2, int64_t offset2, int64_t size02, int64_t size12, int64_t stride02, int64_t stride12,
+                 {c_type}* alloc3, {c_type}* aligned3, int64_t offset3, int64_t size03, int64_t size13, int64_t stride03, int64_t stride13);
+
+void vectorized_{func_name}({c_type}* alloc, {c_type}* aligned, int64_t offset, int64_t size0, int64_t size1, int64_t stride0, int64_t stride1,
+                            {c_type}* alloc2, {c_type}* aligned2, int64_t offset2, int64_t size02, int64_t size12, int64_t stride02, int64_t stride12,
+                            {c_type}* alloc3, {c_type}* aligned3, int64_t offset3, int64_t size03, int64_t size13, int64_t stride03, int64_t stride13);
+
+int main() {{
+    int M = {m}, N = {n}, K = {m};
+    int iterations = 100000;
+    
+    {c_type}* A = ({c_type}*)aligned_alloc({alignment}, M * K * sizeof({c_type}));
+    {c_type}* B = ({c_type}*)aligned_alloc({alignment}, K * N * sizeof({c_type}));
+    {c_type}* C_scalar = ({c_type}*)aligned_alloc({alignment}, M * N * sizeof({c_type}));
+    {c_type}* C_vector = ({c_type}*)aligned_alloc({alignment}, M * N * sizeof({c_type}));
+    
+    for (int i = 0; i < M * K; i++) A[i] = ({c_type})rand() / RAND_MAX;
+    for (int i = 0; i < K * N; i++) B[i] = ({c_type})rand() / RAND_MAX;
+    
+    clock_t start = clock();
+    for (int i = 0; i < iterations; i++) {{
+        {func_name}(A, A, 0, M, K, K, 1,
+                   B, B, 0, K, N, N, 1,
+                   C_scalar, C_scalar, 0, M, N, N, 1);
+    }}
+    clock_t end = clock();
+    double scalar_time = ((double)(end - start)) / CLOCKS_PER_SEC;
+    
+    start = clock();
+    for (int i = 0; i < iterations; i++) {{
+        vectorized_{func_name}(A, A, 0, M, K, K, 1,
+                              B, B, 0, K, N, N, 1,
+                              C_vector, C_vector, 0, M, N, N, 1);
+    }}
+    end = clock();
+    double vector_time = ((double)(end - start)) / CLOCKS_PER_SEC;
+    
+    double speedup = scalar_time / vector_time;
+    printf("Speedup: %.2fx\\n", speedup);
+    
+    free(A);
+    free(B);
+    free(C_scalar);
+    free(C_vector);
+    return 0;
+}}
+""")
+            
+            # Cross-compile wrapper (we'll link on ARM)
+            wrapper_o = os.path.join(strategy_dir, "wrapper.o")
+            try:
+                subprocess.run([
+                    "aarch64-linux-gnu-gcc", "-O3", "-c", wrapper_c, "-o", wrapper_o
+                ], capture_output=True, check=True)
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                # Try clang
+                subprocess.run([
+                    "clang", "--target=aarch64-linux-gnu", "-O3", "-c", wrapper_c, "-o", wrapper_o
+                ], capture_output=True, check=True)
+            
+            executables[strategy] = {
+                'scalar_o': scalar_o,
+                'vectorized_o': vectorized_o,
+                'wrapper_o': wrapper_o
+            }
+            strategy_succeeded = True
+            
+            # Verify files exist for this strategy
+            if not all(os.path.exists(f) for f in [scalar_o, vectorized_o, wrapper_o]):
+                print(f"      Warning: Some object files missing for {strategy}")
+                print(f"        scalar.o exists: {os.path.exists(scalar_o)}")
+                print(f"        vectorized.o exists: {os.path.exists(vectorized_o)}")
+                print(f"        wrapper.o exists: {os.path.exists(wrapper_o)}")
+                strategy_succeeded = False
+        
+        # Verify model directory was created
+        model_dir = os.path.join(temp_dir, "model")
+        if "model" in strategies:
+            if os.path.exists(model_dir):
+                model_files = os.listdir(model_dir)
+                print(f"    Model directory contents: {model_files}")
+            else:
+                print(f"    Warning: Model directory not found at {model_dir}")
+        
+        # Copy all binaries to ARM
+        print(f"  Copying binaries to ARM machine...")
+        # First, ensure the remote directory exists
+        ssh_cmd_prep = ["ssh"]
+        if ssh_key:
+            ssh_cmd_prep.extend(["-i", ssh_key])
+        ssh_cmd_prep.extend([ssh_host, f"mkdir -p {remote_path}/benchmark_binaries"])
+        subprocess.run(ssh_cmd_prep, capture_output=True, check=True)
+        
+        # Copy contents of temp_dir (not the directory itself) to benchmark_binaries
+        scp_cmd = ["scp", "-r"]
+        if ssh_key:
+            scp_cmd.extend(["-i", ssh_key])
+        # Copy each strategy directory individually
+        for strategy in strategies:
+            strategy_dir = os.path.join(temp_dir, strategy)
+            if os.path.exists(strategy_dir):
+                scp_cmd_strategy = ["scp", "-r"]
+                if ssh_key:
+                    scp_cmd_strategy.extend(["-i", ssh_key])
+                scp_cmd_strategy.extend([strategy_dir, f"{ssh_host}:{remote_path}/benchmark_binaries/"])
+                subprocess.run(scp_cmd_strategy, capture_output=True, check=True)
+        
+        # Run benchmarks on ARM
+        print(f"  Running benchmarks on ARM machine...")
+        ssh_cmd = ["ssh"]
+        if ssh_key:
+            ssh_cmd.extend(["-i", ssh_key])
+        ssh_cmd.append(ssh_host)
+        
+        remote_script = f"""
+cd {remote_path}/benchmark_binaries
+for strategy in scalar_remainder unrolled_remainder masked_remainder heuristic model; do
+    echo "Checking strategy: $strategy"
+    if [ -d "$strategy" ]; then
+        echo "Benchmarking $strategy..."
+        cd $strategy
+        # Check if required files exist
+        if [ ! -f scalar.o ] || [ ! -f vectorized.o ] || [ ! -f wrapper.o ]; then
+            echo "Failed: Missing object files (scalar.o, vectorized.o, or wrapper.o)"
+            ls -la
+        elif gcc -O3 scalar.o vectorized.o wrapper.o -o benchmark -lm 2>&1 || clang -O3 scalar.o vectorized.o wrapper.o -o benchmark -lm 2>&1; then
+            if [ -f benchmark ]; then
+                ./benchmark 2>&1
+            else
+                echo "Failed: benchmark binary not created after linking"
+            fi
+        else
+            echo "Failed: linking error (see above)"
+        fi
+        cd ..
+    else
+        echo "Benchmarking $strategy..."
+        echo "Failed: directory not found"
+        echo "Available directories:"
+        ls -d */
+    fi
+done
+"""
+        
+        result = subprocess.run(
+            ssh_cmd + [remote_script],
+            capture_output=True,
+            text=True,
+            timeout=3600
+        )
+        
+        # Parse results
+        output = result.stdout + result.stderr
+        current_strategy = None
+        
+        # Debug: print raw output for model to see what's happening
+        if 'model' in strategies:
+            print(f"    Debug: Checking model output...")
+            lines = output.split('\n')
+            model_lines = []
+            in_model_section = False
+            for i, line in enumerate(lines):
+                if 'Benchmarking model' in line or 'Checking strategy: model' in line:
+                    in_model_section = True
+                if in_model_section:
+                    model_lines.append(line)
+                    # Capture next 10 lines after model section starts
+                    if len(model_lines) > 15:
+                        break
+                elif in_model_section and ('Benchmarking' in line and 'model' not in line):
+                    break
+            
+            if model_lines:
+                print(f"    Model section output:")
+                for line in model_lines:
+                    if line.strip():
+                        print(f"      {line}")
+            else:
+                print(f"    Model section not found in output")
+                # Show last 30 lines for debugging
+                print(f"    Last 30 lines of output:")
+                for line in lines[-30:]:
+                    if line.strip():
+                        print(f"      {line}")
+        
+        for line in output.split('\n'):
+            for strategy in strategies:
+                if f'Benchmarking {strategy}...' in line:
+                    current_strategy = strategy
+                    break
+            
+            if current_strategy and 'Speedup:' in line:
+                match = re.search(r'Speedup:\s+(\d+\.\d+)x', line)
+                if match:
+                    results[current_strategy] = float(match.group(1))
+                    print(f"    {current_strategy}: {results[current_strategy]:.2f}x")
+                    current_strategy = None
+            
+            if current_strategy and ('Failed' in line or 'Error' in line or 'error' in line.lower() or 'segmentation' in line.lower() or 'core dumped' in line.lower()):
+                print(f"    {current_strategy}: Failed - {line.strip()}")
+                # Don't reset current_strategy yet, might be more error info
+                if 'Failed:' in line or 'error:' in line.lower():
+                    # This looks like a complete error message
+                    current_strategy = None
+        
+        # Check if model was attempted but no result
+        if 'model' in strategies and 'model' not in results:
+            if 'Benchmarking model' in output or 'Checking strategy: model' in output:
+                # Look for any error messages related to model
+                model_error_lines = [line for line in output.split('\n') 
+                                    if 'model' in line.lower() and ('error' in line.lower() or 'failed' in line.lower() or 'missing' in line.lower())]
+                if model_error_lines:
+                    print(f"    model: Errors found:")
+                    for err_line in model_error_lines[:5]:  # Show first 5 error lines
+                        print(f"      {err_line.strip()}")
+                else:
+                    print(f"    model: No speedup found in output (may have failed silently)")
+            else:
+                print(f"    model: Not found in benchmark output")
+        
+        # Return heuristic_strategy if it was set (from either heuristic or model)
+        return results, heuristic_strategy if heuristic_strategy else None
+        
+    except Exception as e:
+        print(f"    Error: {str(e)}")
+        return results, heuristic_strategy if strategy in ["heuristic", "model"] else None
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def run_benchmark_remote_old(test_file, vector_isa, machine_config, num_runs=100):
+    """Old method: Run all strategies on remote machine via SSH (requires LLVM on remote)."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
     benchmark_script_name = "benchmark_heuristic.py"
     local_benchmark_script = os.path.join(script_dir, benchmark_script_name)
@@ -606,7 +1057,7 @@ python3 {benchmark_script_name} --machine local --{vector_isa} {remote_test_file
 
     results = {}
     strategies = ["scalar_remainder", "unrolled_remainder",
-                  "masked_remainder", "heuristic"]
+                  "masked_remainder", "heuristic", "model"]
     heuristic_strategy = None
 
     lines = output.split('\n')
@@ -624,7 +1075,7 @@ python3 {benchmark_script_name} --machine local --{vector_isa} {remote_test_file
                 speedup = float(match.group(1))
                 results[current_strategy] = speedup
 
-                if current_strategy == "heuristic" and "(chose:" in line:
+                if current_strategy in ["heuristic", "model"] and "(chose:" in line:
                     strategy_match = re.search(r'\(chose:\s+(\w+)\)', line)
                     if strategy_match:
                         heuristic_strategy = strategy_match.group(1)
@@ -766,7 +1217,12 @@ def main():
         print(f"Benchmarking {test_name} ({m}x{n})...")
 
         if machine_config["type"] == "remote":
-            results, heuristic_strategy = run_benchmark_remote(
+            # Use cross-compilation for ARM targets (much faster!)
+            if vector_isa in ["sve", "sme"]:
+                results, heuristic_strategy = cross_compile_and_benchmark_remote(
+                    test_file, vector_isa, machine_config, num_runs=10)
+            else:
+                results, heuristic_strategy = run_benchmark_remote_old(
                 test_file, vector_isa, machine_config, num_runs=10)
         else:
             llvm_path = machine_config.get("llvm_project_path", None)
@@ -793,20 +1249,25 @@ def main():
     sizes = [r['size'] for r in all_results]
 
     strategies = ["scalar_remainder", "unrolled_remainder",
-                  "masked_remainder", "heuristic"]
+                  "masked_remainder", "heuristic", "model"]
+    # NOTE: "scalar_remainder" is actually the default vectorization strategy
+    # (no explicit remainder handling flags). It is still compared against a
+    # separate pure-scalar baseline in the benchmark. To avoid confusion,
+    # label it as "Default Vectorization" rather than "Scalar Remainder".
     strategy_labels = {
-        "scalar_remainder": "Scalar Remainder",
+        "scalar_remainder": "Default Vectorization",
         "unrolled_remainder": "Unrolled Remainder",
         "masked_remainder": "Masked Remainder",
-        "heuristic": "Heuristic-Based"
+        "heuristic": "Heuristic-Based",
+        "model": "Model-Based"
     }
 
     # Create bar chart
     fig, ax = plt.subplots(figsize=(20, 10))
 
     x = np.arange(len(names))
-    width = 0.2
-    colors = ['#3498db', '#2ecc71', '#e74c3c', '#f39c12']
+    width = 0.15  # Adjusted for 5 strategies
+    colors = ['#3498db', '#2ecc71', '#e74c3c', '#f39c12', '#9b59b6']  # Added purple for model
 
     bars = []
     for i, strategy in enumerate(strategies):
@@ -854,7 +1315,7 @@ def main():
     header = f"{'Test Case':<20} {'Size':<10} {'Strategy':<15}"
     for strategy in strategies:
         header += f" {strategy_labels[strategy]:<18}"
-    header += f" {'Best':<10} {'Heuristic vs Best':<18}"
+    header += f" {'Best':<10} {'Heuristic vs Best':<18} {'Model vs Best':<18}"
     print(header)
     print("-" * 120)
 
@@ -869,6 +1330,7 @@ def main():
                 best_strategy = strategy
 
         heuristic_val = r.get('heuristic')
+        model_val = r.get('model')
         heuristic_strategy = r.get('heuristic_strategy', 'N/A')
 
         if heuristic_val is not None and best_value > 0:
@@ -876,6 +1338,12 @@ def main():
             diff_str = f"{diff_pct:+.1f}%"
         else:
             diff_str = "N/A"
+
+        if model_val is not None and best_value > 0:
+            model_diff_pct = ((model_val - best_value) / best_value) * 100
+            model_diff_str = f"{model_diff_pct:+.1f}%"
+        else:
+            model_diff_str = "N/A"
 
         row = f"{r['name']:<20} {m}x{n:<6} {heuristic_strategy:<15}"
         for strategy in strategies:
@@ -886,7 +1354,7 @@ def main():
                 row += f" {'N/A':<18}"
 
         best_label = strategy_labels[best_strategy] if best_strategy else "N/A"
-        row += f" {best_label:<10} {diff_str:<18}"
+        row += f" {best_label:<10} {diff_str:<18} {model_diff_str:<18}"
         print(row)
 
     print("-" * 120)
@@ -902,6 +1370,8 @@ def main():
 
     heuristic_vals = [r.get('heuristic')
                       for r in all_results if r.get('heuristic') is not None]
+    model_vals = [r.get('model')
+                  for r in all_results if r.get('model') is not None]
     best_vals = []
     for r in all_results:
         best_val = 0
@@ -919,6 +1389,14 @@ def main():
         median_row += f" {'':<10} {median_diff:+.1f}%{'':<14}"
     else:
         median_row += f" {'':<10} {'N/A':<18}"
+    
+    if model_vals and best_vals and len(model_vals) == len(best_vals):
+        median_model = np.median(model_vals)
+        median_best = np.median(best_vals)
+        median_model_diff = ((median_model - median_best) / median_best) * 100
+        median_row += f" {median_model_diff:+.1f}%{'':<14}"
+    else:
+        median_row += f" {'N/A':<18}"
 
     print(median_row)
     print()
