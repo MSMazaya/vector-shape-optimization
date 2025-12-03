@@ -30,43 +30,58 @@ def verify_assembly(asm_file, vector_isa):
     try:
         with open(asm_file, 'r') as f:
             asm_content = f.read()
-        
+
         if vector_isa == "sve":
             # Check for SVE instructions
-            sve_instructions = ['ld1w', 'st1w', 'fmla', 'fadd', 'fmul', 'whilelt', 'ptrue', 'dup']
-            found_instructions = [inst for inst in sve_instructions if inst in asm_content]
+            sve_instructions = ['ld1w', 'st1w', 'fmla',
+                                'fadd', 'fmul', 'whilelt', 'ptrue', 'dup']
+            found_instructions = [
+                inst for inst in sve_instructions if inst in asm_content]
             if not found_instructions:
                 print(f"    Warning: No SVE instructions found in assembly")
-                print(f"    Expected instructions like: {', '.join(sve_instructions[:3])}")
+                print(
+                    f"    Expected instructions like: {', '.join(sve_instructions[:3])}")
             else:
-                print(f"    Verified: Found SVE instructions: {', '.join(found_instructions[:3])}")
+                print(
+                    f"    Verified: Found SVE instructions: {', '.join(found_instructions[:3])}")
         elif vector_isa == "sme":
             # Check for SME instructions
             sme_instructions = ['smstart', 'smstop', 'smopa', 'smops', 'zero']
-            found_instructions = [inst for inst in sme_instructions if inst in asm_content]
+            found_instructions = [
+                inst for inst in sme_instructions if inst in asm_content]
             # SME also uses SVE instructions
             sve_instructions = ['ld1w', 'st1w', 'fmla']
-            found_sve = [inst for inst in sve_instructions if inst in asm_content]
+            found_sve = [
+                inst for inst in sve_instructions if inst in asm_content]
             if not found_instructions and not found_sve:
                 print(f"    Warning: No SME/SVE instructions found in assembly")
-                print(f"    Expected instructions like: {', '.join(sme_instructions + sve_instructions[:2])}")
+                print(
+                    f"    Expected instructions like: {', '.join(sme_instructions + sve_instructions[:2])}")
             else:
                 all_found = found_instructions + found_sve
-                print(f"    Verified: Found SME/SVE instructions: {', '.join(all_found[:4])}")
+                print(
+                    f"    Verified: Found SME/SVE instructions: {', '.join(all_found[:4])}")
         elif vector_isa in ["avx512", "avx2", "avx"]:
             # Check for x86 SIMD instructions
             if vector_isa == "avx512":
-                x86_instructions = ['vfmadd', 'vmovaps', 'vbroadcastss', 'vaddps', 'vmulps']
+                x86_instructions = ['vfmadd', 'vmovaps',
+                                    'vbroadcastss', 'vaddps', 'vmulps']
             elif vector_isa == "avx2":
-                x86_instructions = ['vfmadd', 'vmovaps', 'vbroadcastss', 'vaddps', 'vmulps']
+                x86_instructions = ['vfmadd', 'vmovaps',
+                                    'vbroadcastss', 'vaddps', 'vmulps']
             else:  # avx
-                x86_instructions = ['vfmadd', 'vmovaps', 'vbroadcastss', 'vaddps', 'vmulps']
-            found_instructions = [inst for inst in x86_instructions if inst in asm_content]
+                x86_instructions = ['vfmadd', 'vmovaps',
+                                    'vbroadcastss', 'vaddps', 'vmulps']
+            found_instructions = [
+                inst for inst in x86_instructions if inst in asm_content]
             if not found_instructions:
-                print(f"    Warning: No {vector_isa.upper()} instructions found in assembly")
-                print(f"    Expected instructions like: {', '.join(x86_instructions[:3])}")
+                print(
+                    f"    Warning: No {vector_isa.upper()} instructions found in assembly")
+                print(
+                    f"    Expected instructions like: {', '.join(x86_instructions[:3])}")
             else:
-                print(f"    Verified: Found {vector_isa.upper()} instructions: {', '.join(found_instructions[:3])}")
+                print(
+                    f"    Verified: Found {vector_isa.upper()} instructions: {', '.join(found_instructions[:3])}")
     except Exception as e:
         print(f"    Warning: Could not verify assembly: {e}")
 
@@ -152,12 +167,13 @@ def compile_and_benchmark(test_file, vector_isa, strategy_type, num_runs=100, ll
         vector_width_flag = "--linalg-to-vector-vector-width=128"
         vector_len = 4  # For f32
         llc_march = "x86-64"
-    
+
     # Check if target is available
     if llc_march == "aarch64" and not check_target_available(llvm_path, "aarch64"):
         print(f"    Warning: aarch64 target not available in LLVM build")
         print(f"    Assembly verification cannot be performed on this system")
-        print(f"    Code structure is correct and will work on systems with ARM LLVM support")
+        print(
+            f"    Code structure is correct and will work on systems with ARM LLVM support")
         return None
 
     temp_dir = tempfile.mkdtemp()
@@ -222,7 +238,8 @@ def compile_and_benchmark(test_file, vector_isa, strategy_type, num_runs=100, ll
             # If object file generation fails (e.g., cross-compilation), skip it
             # We'll still verify assembly generation works
             if vector_isa in ["sve", "sme"]:
-                print(f"    Note: Skipping object file generation for {vector_isa.upper()} (cross-compilation)")
+                print(
+                    f"    Note: Skipping object file generation for {vector_isa.upper()} (cross-compilation)")
                 scalar_o = None
             else:
                 raise
@@ -271,7 +288,7 @@ def compile_and_benchmark(test_file, vector_isa, strategy_type, num_runs=100, ll
         chosen_strategy = None
         if strategy_type in ["heuristic", "model"] and result.stderr:
             for line in result.stderr.split('\n'):
-                if "[Strategy Debug] Selected:" in line:
+                if "[Strategy Debug] Selected:" in line or "[Model Strategy] Selected:" in line:
                     if "NO_MASKING" in line:
                         chosen_strategy = "NO_MASKING"
                     elif "UNROLL_REMAINDER" in line:
@@ -329,10 +346,10 @@ def compile_and_benchmark(test_file, vector_isa, strategy_type, num_runs=100, ll
             vectorized_ll,
             "-o", vectorized_asm
         ], capture_output=True, check=True)
-        
+
         # Verify assembly contains correct instructions
         verify_assembly(vectorized_asm, vector_isa)
-        
+
         # Generate object file (may fail for cross-compilation, but that's OK)
         try:
             subprocess.run([
@@ -348,7 +365,8 @@ def compile_and_benchmark(test_file, vector_isa, strategy_type, num_runs=100, ll
             # For ARM targets on x86 hosts, object file generation may fail
             # This is expected for cross-compilation scenarios
             if vector_isa in ["sve", "sme"]:
-                print(f"    Note: Object file generation failed for {vector_isa.upper()} (expected for cross-compilation)")
+                print(
+                    f"    Note: Object file generation failed for {vector_isa.upper()} (expected for cross-compilation)")
                 print(f"    Assembly verification passed - compilation successful")
                 return None  # Can't benchmark without object file, but assembly is correct
             else:
@@ -415,7 +433,7 @@ int main() {{
         if scalar_o is None or not os.path.exists(vectorized_o):
             print(f"    Skipping linking (cross-compilation scenario)")
             return None
-        
+
         executable = os.path.join(temp_dir, "benchmark")
         clang_cmd = ["clang", "-O3"] + clang_flags.split() + [
             wrapper_c, scalar_o, vectorized_o,
@@ -430,7 +448,8 @@ int main() {{
         except subprocess.CalledProcessError as e:
             # For cross-compilation, linking may fail, but assembly is correct
             if vector_isa in ["sve", "sme"]:
-                print(f"    Note: Linking failed for {vector_isa.upper()} (expected for cross-compilation)")
+                print(
+                    f"    Note: Linking failed for {vector_isa.upper()} (expected for cross-compilation)")
                 print(f"    Assembly verification passed - compilation successful")
                 return None
             else:
@@ -490,20 +509,22 @@ int main() {{
 
         if speedups:
             median_speedup = np.median(speedups)
-            if strategy_type == "heuristic":
+            if strategy_type in ["heuristic", "model"]:
                 return (median_speedup, chosen_strategy)
             return median_speedup
 
-        if strategy_type == "heuristic":
+        if strategy_type in ["heuristic", "model"]:
             return (None, chosen_strategy)
         return None
 
     except subprocess.CalledProcessError as e:
         error_msg = ""
         if hasattr(e, 'stderr') and e.stderr:
-            error_msg = str(e.stderr)[:500] if isinstance(e.stderr, bytes) else e.stderr[:500]
+            error_msg = str(e.stderr)[:500] if isinstance(
+                e.stderr, bytes) else e.stderr[:500]
         elif hasattr(e, 'output') and e.output:
-            error_msg = str(e.output)[:500] if isinstance(e.output, bytes) else e.output[:500]
+            error_msg = str(e.output)[:500] if isinstance(
+                e.output, bytes) else e.output[:500]
         else:
             error_msg = str(e)
         if "vector-shape-opt error" not in error_msg:
@@ -522,6 +543,7 @@ def run_benchmark_local(test_file, vector_isa, num_runs=100, llvm_path_override=
                   "masked_remainder", "heuristic", "model"]
     results = {}
     heuristic_strategy = None
+    model_strategy = None
 
     for strategy in strategies:
         print(f"  Benchmarking {strategy}...")
@@ -534,6 +556,8 @@ def run_benchmark_local(test_file, vector_isa, num_runs=100, llvm_path_override=
                 results[strategy] = speedup
                 if strategy == "heuristic":
                     heuristic_strategy = chosen_strategy
+                elif strategy == "model":
+                    model_strategy = chosen_strategy
                 print(
                     f"    Speedup: {speedup:.2f}x (chose: {chosen_strategy})")
             else:
@@ -546,60 +570,85 @@ def run_benchmark_local(test_file, vector_isa, num_runs=100, llvm_path_override=
             else:
                 print(f"    Failed")
 
-    return results, heuristic_strategy
+    return results, heuristic_strategy, model_strategy
 
 
 def cross_compile_and_benchmark_remote(test_file, vector_isa, machine_config, num_runs=100):
-    """Cross-compile locally and run benchmarks on remote ARM machine."""
+    """Cross-compile (or compile) locally and run benchmarks on a remote machine.
+
+    - For ARM SVE/SME: generate aarch64 objects and link/run on remote ARM.
+    - For x86 AVX/AVX2/AVX-512: generate x86-64 objects and link/run on remote x86.
+    """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     llvm_path = os.environ.get('LLVM_PROJECT_PATH',
                                '/home/mazaya/Documents/cmu/interviews/vorticity/llvm-project-vorticity')
-    
+
     ssh_host = machine_config["ssh_host"]
     ssh_key = machine_config.get("ssh_key", "")
     remote_path = machine_config["remote_path"]
-    
-    # Set compilation flags for ARM
+
+    # Set compilation flags based on ISA / target
     if vector_isa == "sve":
+        # ARM SVE
         llc_attrs = "-mattr=+sve"
         vector_width_flag = "--linalg-to-vector-vector-width=256"
         llc_march = "aarch64"
+        is_arm = True
     elif vector_isa == "sme":
+        # ARM SME (with SVE)
         llc_attrs = "-mattr=+sme,+sve"
         vector_width_flag = "--linalg-to-vector-vector-width=256"
         llc_march = "aarch64"
+        is_arm = True
+    elif vector_isa == "avx512":
+        # x86 AVX-512
+        llc_attrs = "-mattr=+avx512f,+avx512vl"
+        vector_width_flag = "--linalg-to-vector-vector-width=512"
+        llc_march = "x86-64"
+        is_arm = False
+    elif vector_isa == "avx2":
+        # x86 AVX2
+        llc_attrs = "-mattr=+avx2,+fma"
+        vector_width_flag = "--linalg-to-vector-vector-width=256"
+        llc_march = "x86-64"
+        is_arm = False
     else:
-        # For non-ARM, use old method
-        return run_benchmark_remote_old(test_file, vector_isa, machine_config, num_runs)
-    
+        # Default x86 AVX
+        llc_attrs = "-mattr=+avx,+fma"
+        vector_width_flag = "--linalg-to-vector-vector-width=128"
+        llc_march = "x86-64"
+        is_arm = False
+
     test_file_abs = os.path.abspath(test_file)
     test_file_name = os.path.basename(test_file)
-    
+
     print(f"  Cross-compiling {test_file_name} locally for ARM...")
-    
+
     # Read test file
     with open(test_file, 'r') as f:
         content = f.read()
         func_match = re.search(r'func\.func @(\w+)', content)
         func_name = func_match.group(1) if func_match else "matmul"
-        
+
         if 'f64' in content or 'double' in content:
             c_type = 'double'
             alignment = 64
         else:
             c_type = 'float'
             alignment = 32
-    
+
     dims = get_matrix_size(test_file)
     if not dims:
         return {}, None
     m, n = dims
-    
+
     temp_dir = tempfile.mkdtemp()
-    strategies = ["scalar_remainder", "unrolled_remainder", "masked_remainder", "heuristic", "model"]
+    strategies = ["scalar_remainder", "unrolled_remainder",
+                  "masked_remainder", "heuristic", "model"]
     results = {}
     heuristic_strategy = None
-    
+    model_strategy = None
+
     try:
         # Preprocess test file
         preprocessed_file = os.path.join(temp_dir, "preprocessed.mlir")
@@ -611,35 +660,36 @@ def cross_compile_and_benchmark_remote(test_file, vector_isa, machine_config, nu
             content = f"module {{\n{content}\n}}\n"
         with open(preprocessed_file, 'w') as f_out:
             f_out.write(content)
-        
+
         # Compile each strategy
         executables = {}
         for strategy in strategies:
             print(f"    Compiling {strategy}...")
             strategy_dir = os.path.join(temp_dir, strategy)
             os.makedirs(strategy_dir, exist_ok=True)
-            
+
             # Track if this strategy compilation succeeded
             strategy_succeeded = False
-            
+
             # Run vector-shape-opt
             vector_opt_cmd = [
                 f"{script_dir}/build/tools/vector-shape-opt/vector-shape-opt",
                 "--linalg-to-vector",
                 vector_width_flag
             ]
-            
+
             if strategy == "unrolled_remainder":
                 vector_opt_cmd.append("--linalg-to-vector-unroll-scalar-k")
             elif strategy == "masked_remainder":
-                vector_opt_cmd.append("--linalg-to-vector-use-masked-remainder")
+                vector_opt_cmd.append(
+                    "--linalg-to-vector-use-masked-remainder")
             elif strategy == "heuristic":
                 vector_opt_cmd.append("--linalg-to-vector-use-heuristic")
                 vector_opt_cmd.append("--linalg-to-vector-debug-strategy")
             elif strategy == "model":
                 vector_opt_cmd.append("--linalg-to-vector-use-model")
                 vector_opt_cmd.append("--linalg-to-vector-debug-strategy")
-            
+
             result = subprocess.run(
                 vector_opt_cmd + [preprocessed_file],
                 stdout=subprocess.PIPE,
@@ -647,39 +697,61 @@ def cross_compile_and_benchmark_remote(test_file, vector_isa, machine_config, nu
                 text=True,
                 check=False
             )
-            
+
             if result.returncode != 0:
-                print(f"      Error compiling {strategy}: {result.stderr[:500]}")
+                print(
+                    f"      Error compiling {strategy}: {result.stderr[:500]}")
                 if strategy == "model":
-                    print(f"      Model compilation failed - check if model is properly integrated")
+                    print(
+                        f"      Model compilation failed - check if model is properly integrated")
                     print(f"      Full stderr: {result.stderr}")
                 # Remove the directory if compilation failed
                 if os.path.exists(strategy_dir):
                     shutil.rmtree(strategy_dir, ignore_errors=True)
                 continue
-            
+
             # Extract strategy choice for heuristic/model
             if strategy in ["heuristic", "model"] and result.stderr:
+                chosen_strategy = None
                 for line in result.stderr.split('\n'):
-                    if "[Strategy Debug] Selected:" in line:
+                    # Check for both "[Strategy Debug] Selected:" and "[Model Strategy] Selected:"
+                    if "[Strategy Debug] Selected:" in line or "[Model Strategy] Selected:" in line:
                         if "NO_MASKING" in line:
-                            heuristic_strategy = "NO_MASKING"
+                            chosen_strategy = "NO_MASKING"
                         elif "UNROLL_REMAINDER" in line:
-                            heuristic_strategy = "UNROLL_REMAINDER"
+                            chosen_strategy = "UNROLL_REMAINDER"
                         elif "MASK_REMAINDER" in line:
-                            heuristic_strategy = "MASK_REMAINDER"
+                            chosen_strategy = "MASK_REMAINDER"
                         elif "MASK_BODY" in line:
-                            heuristic_strategy = "MASK_BODY"
+                            chosen_strategy = "MASK_BODY"
                         break
-            
+                # Store strategy choice separately for heuristic and model
+                if strategy == "heuristic":
+                    heuristic_strategy = chosen_strategy
+                    if chosen_strategy:
+                        print(f"      Heuristic chose: {chosen_strategy}")
+                elif strategy == "model":
+                    model_strategy = chosen_strategy
+                    if chosen_strategy:
+                        print(f"      Model chose: {chosen_strategy}")
+                elif not chosen_strategy:
+                    # Debug: show what we found in stderr
+                    if result.stderr:
+                        debug_lines = [l for l in result.stderr.split(
+                            '\n') if 'Strategy' in l or 'Selected' in l]
+                        if debug_lines:
+                            print(
+                                f"      Debug: Found strategy-related lines: {debug_lines[:3]}")
+
             vectorized_mlir = os.path.join(strategy_dir, "vectorized.mlir")
             with open(vectorized_mlir, 'w') as f:
                 f.write(result.stdout)
-            
+
             # Lower to LLVM IR
-            vectorized_lowered = os.path.join(strategy_dir, "vectorized_lowered.mlir")
+            vectorized_lowered = os.path.join(
+                strategy_dir, "vectorized_lowered.mlir")
             vectorized_ll = os.path.join(strategy_dir, "vectorized.ll")
-            
+
             subprocess.run([
                 f"{llvm_path}/build/bin/mlir-opt",
                 vectorized_mlir,
@@ -693,21 +765,22 @@ def cross_compile_and_benchmark_remote(test_file, vector_isa, machine_config, nu
                 "--reconcile-unrealized-casts",
                 "-o", vectorized_lowered
             ], capture_output=True, check=True)
-            
+
             # Rename function
             with open(vectorized_lowered, 'r') as f:
                 content = f.read()
-            content = content.replace(f"@{func_name}", f"@vectorized_{func_name}")
+            content = content.replace(
+                f"@{func_name}", f"@vectorized_{func_name}")
             with open(vectorized_lowered, 'w') as f:
                 f.write(content)
-            
+
             subprocess.run([
                 f"{llvm_path}/build/bin/mlir-translate",
                 "--mlir-to-llvmir",
                 vectorized_lowered,
                 "-o", vectorized_ll
             ], capture_output=True, check=True)
-            
+
             # Cross-compile to ARM object file
             vectorized_o = os.path.join(strategy_dir, "vectorized.o")
             subprocess.run([
@@ -719,12 +792,12 @@ def cross_compile_and_benchmark_remote(test_file, vector_isa, machine_config, nu
                 vectorized_ll,
                 "-o", vectorized_o
             ], capture_output=True, check=True)
-            
+
             # Also compile scalar version
             scalar_mlir = os.path.join(strategy_dir, "scalar.mlir")
             scalar_ll = os.path.join(strategy_dir, "scalar.ll")
             scalar_o = os.path.join(strategy_dir, "scalar.o")
-            
+
             subprocess.run([
                 f"{llvm_path}/build/bin/mlir-opt",
                 preprocessed_file,
@@ -739,14 +812,14 @@ def cross_compile_and_benchmark_remote(test_file, vector_isa, machine_config, nu
                 "--reconcile-unrealized-casts",
                 "-o", scalar_mlir
             ], capture_output=True, check=True)
-            
+
             subprocess.run([
                 f"{llvm_path}/build/bin/mlir-translate",
                 "--mlir-to-llvmir",
                 scalar_mlir,
                 "-o", scalar_ll
             ], capture_output=True, check=True)
-            
+
             subprocess.run([
                 f"{llvm_path}/build/bin/llc",
                 f"-march={llc_march}",
@@ -755,7 +828,7 @@ def cross_compile_and_benchmark_remote(test_file, vector_isa, machine_config, nu
                 scalar_ll,
                 "-o", scalar_o
             ], capture_output=True, check=True)
-            
+
             # Create wrapper
             wrapper_c = os.path.join(strategy_dir, "wrapper.c")
             with open(wrapper_c, 'w') as f:
@@ -813,34 +886,48 @@ int main() {{
     return 0;
 }}
 """)
-            
-            # Cross-compile wrapper (we'll link on ARM)
+
+        # Compile wrapper (cross-compile for ARM, native for x86)
             wrapper_o = os.path.join(strategy_dir, "wrapper.o")
             try:
-                subprocess.run([
-                    "aarch64-linux-gnu-gcc", "-O3", "-c", wrapper_c, "-o", wrapper_o
-                ], capture_output=True, check=True)
+                if is_arm:
+                    # Cross-compile for ARM
+                    subprocess.run([
+                        "aarch64-linux-gnu-gcc", "-O3", "-c", wrapper_c, "-o", wrapper_o
+                    ], capture_output=True, check=True)
+                else:
+                    # Native x86 wrapper object
+                    subprocess.run([
+                        "gcc", "-O3", "-c", wrapper_c, "-o", wrapper_o
+                    ], capture_output=True, check=True)
             except (subprocess.CalledProcessError, FileNotFoundError):
-                # Try clang
-                subprocess.run([
-                    "clang", "--target=aarch64-linux-gnu", "-O3", "-c", wrapper_c, "-o", wrapper_o
-                ], capture_output=True, check=True)
-            
+                # Fallback to clang
+                if is_arm:
+                    subprocess.run([
+                        "clang", "--target=aarch64-linux-gnu", "-O3", "-c", wrapper_c, "-o", wrapper_o
+                    ], capture_output=True, check=True)
+                else:
+                    subprocess.run([
+                        "clang", "-O3", "-c", wrapper_c, "-o", wrapper_o
+                    ], capture_output=True, check=True)
+
             executables[strategy] = {
                 'scalar_o': scalar_o,
                 'vectorized_o': vectorized_o,
                 'wrapper_o': wrapper_o
             }
             strategy_succeeded = True
-            
+
             # Verify files exist for this strategy
             if not all(os.path.exists(f) for f in [scalar_o, vectorized_o, wrapper_o]):
-                print(f"      Warning: Some object files missing for {strategy}")
+                print(
+                    f"      Warning: Some object files missing for {strategy}")
                 print(f"        scalar.o exists: {os.path.exists(scalar_o)}")
-                print(f"        vectorized.o exists: {os.path.exists(vectorized_o)}")
+                print(
+                    f"        vectorized.o exists: {os.path.exists(vectorized_o)}")
                 print(f"        wrapper.o exists: {os.path.exists(wrapper_o)}")
                 strategy_succeeded = False
-        
+
         # Verify model directory was created
         model_dir = os.path.join(temp_dir, "model")
         if "model" in strategies:
@@ -849,16 +936,17 @@ int main() {{
                 print(f"    Model directory contents: {model_files}")
             else:
                 print(f"    Warning: Model directory not found at {model_dir}")
-        
-        # Copy all binaries to ARM
-        print(f"  Copying binaries to ARM machine...")
+
+        # Copy all binaries to remote
+        print(f"  Copying binaries to remote machine...")
         # First, ensure the remote directory exists
         ssh_cmd_prep = ["ssh"]
         if ssh_key:
             ssh_cmd_prep.extend(["-i", ssh_key])
-        ssh_cmd_prep.extend([ssh_host, f"mkdir -p {remote_path}/benchmark_binaries"])
+        ssh_cmd_prep.extend(
+            [ssh_host, f"mkdir -p {remote_path}/benchmark_binaries"])
         subprocess.run(ssh_cmd_prep, capture_output=True, check=True)
-        
+
         # Copy contents of temp_dir (not the directory itself) to benchmark_binaries
         scp_cmd = ["scp", "-r"]
         if ssh_key:
@@ -870,16 +958,18 @@ int main() {{
                 scp_cmd_strategy = ["scp", "-r"]
                 if ssh_key:
                     scp_cmd_strategy.extend(["-i", ssh_key])
-                scp_cmd_strategy.extend([strategy_dir, f"{ssh_host}:{remote_path}/benchmark_binaries/"])
-                subprocess.run(scp_cmd_strategy, capture_output=True, check=True)
-        
-        # Run benchmarks on ARM
-        print(f"  Running benchmarks on ARM machine...")
+                scp_cmd_strategy.extend(
+                    [strategy_dir, f"{ssh_host}:{remote_path}/benchmark_binaries/"])
+                subprocess.run(scp_cmd_strategy,
+                               capture_output=True, check=True)
+
+        # Run benchmarks on remote machine
+        print(f"  Running benchmarks on remote machine...")
         ssh_cmd = ["ssh"]
         if ssh_key:
             ssh_cmd.extend(["-i", ssh_key])
         ssh_cmd.append(ssh_host)
-        
+
         remote_script = f"""
 cd {remote_path}/benchmark_binaries
 for strategy in scalar_remainder unrolled_remainder masked_remainder heuristic model; do
@@ -909,18 +999,18 @@ for strategy in scalar_remainder unrolled_remainder masked_remainder heuristic m
     fi
 done
 """
-        
+
         result = subprocess.run(
             ssh_cmd + [remote_script],
             capture_output=True,
             text=True,
             timeout=3600
         )
-        
+
         # Parse results
         output = result.stdout + result.stderr
         current_strategy = None
-        
+
         # Debug: print raw output for model to see what's happening
         if 'model' in strategies:
             print(f"    Debug: Checking model output...")
@@ -937,7 +1027,7 @@ done
                         break
                 elif in_model_section and ('Benchmarking' in line and 'model' not in line):
                     break
-            
+
             if model_lines:
                 print(f"    Model section output:")
                 for line in model_lines:
@@ -950,48 +1040,93 @@ done
                 for line in lines[-30:]:
                     if line.strip():
                         print(f"      {line}")
-        
+
+        # Also look for strategy choices in the output (from compilation stderr that might be included)
+        for line in output.split('\n'):
+            # Look for strategy debug output from compilation
+            if "[Strategy Debug] Selected:" in line or "[Model Strategy] Selected:" in line:
+                # Extract strategy name
+                if "NO_MASKING" in line:
+                    chosen = "NO_MASKING"
+                elif "UNROLL_REMAINDER" in line:
+                    chosen = "UNROLL_REMAINDER"
+                elif "MASK_REMAINDER" in line:
+                    chosen = "MASK_REMAINDER"
+                elif "MASK_BODY" in line:
+                    chosen = "MASK_BODY"
+                else:
+                    chosen = None
+
+                # Try to determine which strategy this is for by looking at context
+                # This is tricky since we're parsing remote output, but we can try
+                # to match based on nearby lines
+                if chosen:
+                    # Look backwards for "Benchmarking" or "Checking strategy"
+                    lines_list = output.split('\n')
+                    line_idx = lines_list.index(line)
+                    for i in range(max(0, line_idx - 10), line_idx):
+                        if "Benchmarking heuristic" in lines_list[i] or "Checking strategy: heuristic" in lines_list[i]:
+                            heuristic_strategy = chosen
+                            break
+                        elif "Benchmarking model" in lines_list[i] or "Checking strategy: model" in lines_list[i]:
+                            model_strategy = chosen
+                            break
+
         for line in output.split('\n'):
             for strategy in strategies:
                 if f'Benchmarking {strategy}...' in line:
                     current_strategy = strategy
                     break
-            
+
             if current_strategy and 'Speedup:' in line:
                 match = re.search(r'Speedup:\s+(\d+\.\d+)x', line)
                 if match:
                     results[current_strategy] = float(match.group(1))
-                    print(f"    {current_strategy}: {results[current_strategy]:.2f}x")
+                    # Try to find strategy choice for this strategy
+                    strategy_choice = None
+                    if current_strategy == "heuristic" and heuristic_strategy:
+                        strategy_choice = heuristic_strategy
+                    elif current_strategy == "model" and model_strategy:
+                        strategy_choice = model_strategy
+
+                    if strategy_choice:
+                        print(
+                            f"    {current_strategy}: {results[current_strategy]:.2f}x (chose: {strategy_choice})")
+                    else:
+                        print(
+                            f"    {current_strategy}: {results[current_strategy]:.2f}x")
                     current_strategy = None
-            
+
             if current_strategy and ('Failed' in line or 'Error' in line or 'error' in line.lower() or 'segmentation' in line.lower() or 'core dumped' in line.lower()):
                 print(f"    {current_strategy}: Failed - {line.strip()}")
                 # Don't reset current_strategy yet, might be more error info
                 if 'Failed:' in line or 'error:' in line.lower():
                     # This looks like a complete error message
                     current_strategy = None
-        
+
         # Check if model was attempted but no result
         if 'model' in strategies and 'model' not in results:
             if 'Benchmarking model' in output or 'Checking strategy: model' in output:
                 # Look for any error messages related to model
-                model_error_lines = [line for line in output.split('\n') 
-                                    if 'model' in line.lower() and ('error' in line.lower() or 'failed' in line.lower() or 'missing' in line.lower())]
+                model_error_lines = [line for line in output.split('\n')
+                                     if 'model' in line.lower() and ('error' in line.lower() or 'failed' in line.lower() or 'missing' in line.lower())]
                 if model_error_lines:
                     print(f"    model: Errors found:")
-                    for err_line in model_error_lines[:5]:  # Show first 5 error lines
+                    # Show first 5 error lines
+                    for err_line in model_error_lines[:5]:
                         print(f"      {err_line.strip()}")
                 else:
-                    print(f"    model: No speedup found in output (may have failed silently)")
+                    print(
+                        f"    model: No speedup found in output (may have failed silently)")
             else:
                 print(f"    model: Not found in benchmark output")
-        
-        # Return heuristic_strategy if it was set (from either heuristic or model)
-        return results, heuristic_strategy if heuristic_strategy else None
-        
+
+        # Return both heuristic and model strategies
+        return results, heuristic_strategy if heuristic_strategy else None, model_strategy if model_strategy else None
+
     except Exception as e:
         print(f"    Error: {str(e)}")
-        return results, heuristic_strategy if strategy in ["heuristic", "model"] else None
+        return results, heuristic_strategy if heuristic_strategy else None, model_strategy if model_strategy else None
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -1051,14 +1186,23 @@ python3 {benchmark_script_name} --machine local --{vector_isa} {remote_test_file
 
     if result.returncode != 0:
         print(f"    Remote execution error (return code {result.returncode}):")
-        print(f"    STDOUT: {result.stdout[:1000]}")
-        print(f"    STDERR: {result.stderr[:1000]}")
-        return {}
+        print(f"    STDOUT: {result.stdout[:2000]}")
+        print(f"    STDERR: {result.stderr[:2000]}")
+        # Try to extract actual error from output
+        if 'Traceback' in output or 'Error' in output or 'Exception' in output:
+            error_start = output.lower().find('error')
+            if error_start == -1:
+                error_start = output.lower().find('traceback')
+            if error_start != -1:
+                print(
+                    f"    Full error context: {output[max(0, error_start-100):error_start+500]}")
+        return {}, None, None
 
     results = {}
     strategies = ["scalar_remainder", "unrolled_remainder",
                   "masked_remainder", "heuristic", "model"]
     heuristic_strategy = None
+    model_strategy = None
 
     lines = output.split('\n')
     current_strategy = None
@@ -1078,7 +1222,11 @@ python3 {benchmark_script_name} --machine local --{vector_isa} {remote_test_file
                 if current_strategy in ["heuristic", "model"] and "(chose:" in line:
                     strategy_match = re.search(r'\(chose:\s+(\w+)\)', line)
                     if strategy_match:
-                        heuristic_strategy = strategy_match.group(1)
+                        chosen = strategy_match.group(1)
+                        if current_strategy == "heuristic":
+                            heuristic_strategy = chosen
+                        elif current_strategy == "model":
+                            model_strategy = chosen
 
                 current_strategy = None
 
@@ -1097,7 +1245,7 @@ python3 {benchmark_script_name} --machine local --{vector_isa} {remote_test_file
             print(
                 f"    Error in output: {output[output.lower().find('error'):output.lower().find('error')+200]}")
 
-    return results, heuristic_strategy
+    return results, heuristic_strategy, model_strategy
 
 
 def load_machine_config():
@@ -1219,14 +1367,14 @@ def main():
         if machine_config["type"] == "remote":
             # Use cross-compilation for ARM targets (much faster!)
             if vector_isa in ["sve", "sme"]:
-                results, heuristic_strategy = cross_compile_and_benchmark_remote(
-                    test_file, vector_isa, machine_config, num_runs=10)
+                results, heuristic_strategy, model_strategy = cross_compile_and_benchmark_remote(
+                    test_file, vector_isa, machine_config, num_runs=100)
             else:
-                results, heuristic_strategy = run_benchmark_remote_old(
-                test_file, vector_isa, machine_config, num_runs=10)
+                results, heuristic_strategy, model_strategy = run_benchmark_remote_old(
+                    test_file, vector_isa, machine_config, num_runs=100)
         else:
             llvm_path = machine_config.get("llvm_project_path", None)
-            results, heuristic_strategy = run_benchmark_local(
+            results, heuristic_strategy, model_strategy = run_benchmark_local(
                 test_file, vector_isa, num_runs=10, llvm_path_override=llvm_path)
 
         if any(results.values()):
@@ -1234,6 +1382,7 @@ def main():
                 'name': test_name,
                 'size': dims,
                 'heuristic_strategy': heuristic_strategy,
+                'model_strategy': model_strategy,
                 **results
             })
             print()
@@ -1267,7 +1416,8 @@ def main():
 
     x = np.arange(len(names))
     width = 0.15  # Adjusted for 5 strategies
-    colors = ['#3498db', '#2ecc71', '#e74c3c', '#f39c12', '#9b59b6']  # Added purple for model
+    colors = ['#3498db', '#2ecc71', '#e74c3c',
+              '#f39c12', '#9b59b6']  # Added purple for model
 
     bars = []
     for i, strategy in enumerate(strategies):
@@ -1332,6 +1482,7 @@ def main():
         heuristic_val = r.get('heuristic')
         model_val = r.get('model')
         heuristic_strategy = r.get('heuristic_strategy', 'N/A')
+        model_strategy = r.get('model_strategy', 'N/A')
 
         if heuristic_val is not None and best_value > 0:
             diff_pct = ((heuristic_val - best_value) / best_value) * 100
@@ -1345,7 +1496,7 @@ def main():
         else:
             model_diff_str = "N/A"
 
-        row = f"{r['name']:<20} {m}x{n:<6} {heuristic_strategy:<15}"
+        row = f"{r['name']:<20} {m}x{n:<6} {heuristic_strategy:<15} {model_strategy:<15}"
         for strategy in strategies:
             val = r.get(strategy)
             if val is not None:
@@ -1389,7 +1540,7 @@ def main():
         median_row += f" {'':<10} {median_diff:+.1f}%{'':<14}"
     else:
         median_row += f" {'':<10} {'N/A':<18}"
-    
+
     if model_vals and best_vals and len(model_vals) == len(best_vals):
         median_model = np.median(model_vals)
         median_best = np.median(best_vals)
