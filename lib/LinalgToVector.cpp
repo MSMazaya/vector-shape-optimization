@@ -49,16 +49,22 @@ static llvm::cl::opt<int> bodyMaskingStrideOpt(
     llvm::cl::desc("Body masking stride (LS) in elements. When LS < VS, body is masked with stride LS. Remainder handling is independent (use --linalg-to-vector-use-masked-remainder or --linalg-to-vector-unroll-scalar-k)."),
     llvm::cl::init(0));
 
-// Vector width option (128 for AVX, 512 for AVX-512)
+// Vector width option (128 for AVX, 512 for AVX-512, 256 for ARM SVE)
 static llvm::cl::opt<int> vectorWidthOpt(
     "linalg-to-vector-vector-width",
-    llvm::cl::desc("Vector width in bits (128 for AVX, 512 for AVX-512)"),
+    llvm::cl::desc("Vector width in bits (128 for AVX, 256 for AVX2/SVE, 512 for AVX-512)"),
     llvm::cl::init(128));
 
 // Cache line size option for body masking stride heuristic
 static llvm::cl::opt<bool> useCacheLineStrideOpt(
     "linalg-to-vector-use-cache-line-stride",
     llvm::cl::desc("Use cache line size (64 bytes) as stride heuristic for body masking"),
+    llvm::cl::init(false));
+
+// Cache blocking option
+static llvm::cl::opt<bool> useCacheBlockingOpt(
+    "linalg-to-vector-use-cache-blocking",
+    llvm::cl::desc("Use cache blocking to determine optimal vector logical size based on cache hierarchy"),
     llvm::cl::init(false));
 
 // Heuristic-based strategy selection
@@ -97,6 +103,106 @@ int64_t getCacheLineStride(Type elementType, int64_t vectorLen) {
   return std::min(cacheLineStride, vectorLen);
 }
 
+// Cache hierarchy information (detected from system)
+struct CacheInfo {
+  int64_t l1dSizeBytes;    // L1 data cache size
+  int64_t l2SizeBytes;     // L2 cache size
+  int64_t l3SizeBytes;     // L3 cache size
+  int64_t cacheLineBytes;  // Cache line size
+  
+  CacheInfo() {
+    // Default values based on typical x86-64 systems
+    // These can be overridden by system detection
+    l1dSizeBytes = 32768;      // 32 KB
+    l2SizeBytes = 2097152;      // 2 MB
+    l3SizeBytes = 12582912;     // 12 MB
+    cacheLineBytes = 64;
+  }
+};
+
+// Get cache information (can be extended to detect from system)
+CacheInfo getCacheInfo() {
+  CacheInfo info;
+  // TODO: Could detect from /sys/devices/system/cpu/cpu0/cache/ or cpuid
+  // For now, use defaults based on typical systems
+  return info;
+}
+
+// Calculate optimal vector logical size based on cache blocking
+// For matrix multiplication C = A * B, we need to consider:
+// - Working set: A block (m_block x k), B block (k x n_block), C block (m_block x n_block)
+// - Goal: Keep working set in L1 cache for best performance
+// - Vector logical size should align with cache blocking strategy
+int64_t getCacheBlockedVectorSize(int64_t m, int64_t n, int64_t k, Type elementType, 
+                                   int64_t vectorLen, CacheInfo& cacheInfo) {
+  unsigned bitWidth = elementType.getIntOrFloatBitWidth();
+  unsigned byteWidth = bitWidth / 8;
+  
+  // Target: Keep working set in L1 cache
+  // Conservative estimate: use 75% of L1 cache to leave room for other data
+  int64_t l1dAvailable = (cacheInfo.l1dSizeBytes * 3) / 4;
+  
+  // For matrix multiplication, we process columns of B and rows of A
+  // Working set per iteration:
+  // - A: m_block * k elements (scalar broadcast, so only k elements loaded)
+  // - B: k * n_block elements (vectorized, so k * n_block elements)
+  // - C: m_block * n_block elements (accumulator)
+  // Total: k + k*n_block + m_block*n_block elements
+  
+  // For cache blocking, we want to choose n_block (vector logical size) such that:
+  // k + k*n_block + m_block*n_block <= l1dAvailable / element_size
+  // Simplifying: assume m_block = 1 (process one row at a time)
+  // Then: k + k*n_block + n_block <= l1dAvailable / element_size
+  // Rearranging: n_block * (k + 1) <= (l1dAvailable / element_size) - k
+  // n_block <= ((l1dAvailable / element_size) - k) / (k + 1)
+  
+  int64_t elementsInL1 = l1dAvailable / byteWidth;
+  
+  // Calculate maximum n_block that fits in L1
+  // Conservative: assume we need space for A (k), B (k * n_block), and C (n_block)
+  int64_t maxNBlock = 0;
+  if (k > 0 && k < elementsInL1) {
+    int64_t availableForBNC = elementsInL1 - k;
+    if (availableForBNC > 0) {
+      // n_block * (k + 1) <= availableForBNC
+      maxNBlock = availableForBNC / (k + 1);
+    }
+  }
+  
+  // Also consider cache line alignment
+  int64_t cacheLineStride = getCacheLineStride(elementType, vectorLen);
+  
+  // Choose optimal vector size:
+  // 1. Should fit in L1 cache (maxNBlock)
+  // 2. Should be <= hardware vector width (vectorLen)
+  // 3. Should align with cache lines when possible
+  // 4. Should be a divisor of n when possible
+  
+  int64_t optimalSize = vectorLen; // Default to hardware max
+  
+  // Try to find a size that fits cache constraints
+  for (int64_t candidate = std::min(maxNBlock, vectorLen); candidate > 0; candidate--) {
+    // Prefer sizes that:
+    // - Are cache line aligned
+    // - Divide n evenly
+    bool cacheAligned = (candidate == cacheLineStride || candidate % cacheLineStride == 0);
+    bool dividesN = (n % candidate == 0);
+    
+    if (cacheAligned || dividesN) {
+      optimalSize = candidate;
+      break;
+    }
+  }
+  
+  // If no good candidate found, use cache line stride if it fits
+  if (optimalSize == vectorLen && cacheLineStride <= maxNBlock && cacheLineStride <= vectorLen) {
+    optimalSize = cacheLineStride;
+  }
+  
+  // Ensure we don't exceed hardware vector width
+  return std::min(optimalSize, vectorLen);
+}
+
 // Strategy decision structure
 struct StrategyDecision {
   enum StrategyType {
@@ -115,123 +221,6 @@ struct StrategyDecision {
   StrategyDecision() : strategy(MASK_REMAINDER), stride(0), useStride(false),
                        cacheAligned(false), eliminatesRemainder(false) {}
 };
-
-// Input weights for cost function
-// Tuned based on benchmark results: masking capability is the most important factor
-struct InputWeights {
-  double alignmentWeight;      // Weight for alignment/vector size
-  double maskingCapabilityWeight; // Weight for ISA masking capability (increased - most important)
-  double cacheLineWeight;      // Weight for cache line size
-  
-  InputWeights() : alignmentWeight(0.2), maskingCapabilityWeight(0.7), cacheLineWeight(0.1) {}
-};
-
-// Cost function f(input) - evaluates the cost/benefit of different strategies
-struct CostEvaluation {
-  double alignmentScore;      // Score based on alignment/vector size
-  double maskingScore;        // Score based on masking capability
-  double cacheLineScore;      // Score based on cache line alignment
-  double remainderCost;       // Cost of handling remainder
-  
-  CostEvaluation() : alignmentScore(0.0), maskingScore(0.0), 
-                     cacheLineScore(0.0), remainderCost(0.0) {}
-  
-  double weightedCost(const InputWeights& weights) const {
-    return (alignmentScore * weights.alignmentWeight +
-            maskingScore * weights.maskingCapabilityWeight +
-            cacheLineScore * weights.cacheLineWeight) - remainderCost;
-  }
-};
-
-// Cost function f(input)
-CostEvaluation evaluateCost(
-    int64_t n, int64_t vectorLen, Type elementType,
-    bool hasMaskingCapability, bool hasStaticDims) {
-  CostEvaluation cost;
-  
-  // Alignment score: how well does n align with vectorLen?
-  int64_t remainder = n % vectorLen;
-  double alignmentRatio = remainder == 0 ? 1.0 : 1.0 - (double)remainder / vectorLen;
-  cost.alignmentScore = alignmentRatio;
-  
-  // Masking score: how beneficial is masking? 
-  // Based on results: masking is almost always better when available, especially for AVX-512
-  if (hasMaskingCapability) {
-    if (remainder == 0) {
-      cost.maskingScore = 1.0; // Perfect case
-    } else {
-      // Masking is highly beneficial - give it a high score
-      // Small penalty for very large remainders, but still prefer masking
-      double remainderRatio = (double)remainder / vectorLen;
-      // More aggressive: masking is almost always better, minimal penalty
-      cost.maskingScore = 1.0 - remainderRatio * 0.1; // Very small penalty even for large remainders
-    }
-  } else {
-    cost.maskingScore = 0.0;
-  }
-  
-  // Cache line score: how well does stride align with cache lines?
-  int64_t cacheLineStride = getCacheLineStride(elementType, vectorLen);
-  if (n % cacheLineStride == 0 && cacheLineStride <= vectorLen) {
-    cost.cacheLineScore = 1.0;
-  } else {
-    // Check if any divisor of n that's <= vectorLen aligns with cache line
-    bool foundCacheAligned = false;
-    for (int64_t stride = vectorLen; stride > 0; stride--) {
-      if (n % stride == 0 && stride == cacheLineStride) {
-        foundCacheAligned = true;
-        break;
-      }
-    }
-    cost.cacheLineScore = foundCacheAligned ? 0.8 : 0.0;
-  }
-  
-  // Remainder cost: cost of handling remainder (higher for larger remainders)
-  if (remainder == 0) {
-    cost.remainderCost = 0.0;
-  } else {
-    double remainderRatio = (double)remainder / vectorLen;
-    cost.remainderCost = remainderRatio * 0.3; // Cost increases with remainder size
-  }
-  
-  return cost;
-}
-
-// Find optimal stride for masking
-int64_t findOptimalMaskingStride(int64_t n, int64_t vectorLen, Type elementType,
-                                  bool& cacheAligned, bool& eliminatesRemainder) {
-  cacheAligned = false;
-  eliminatesRemainder = false;
-  
-  int64_t cacheLineStride = getCacheLineStride(elementType, vectorLen);
-  
-  // Priority 1: Cache-aligned stride that eliminates remainder
-  if (cacheLineStride > 0 && n % cacheLineStride == 0 && cacheLineStride <= vectorLen) {
-    cacheAligned = true;
-    eliminatesRemainder = true;
-    return cacheLineStride;
-  }
-  
-  // Priority 2: Any stride that eliminates remainder (prefer larger)
-  for (int64_t stride = vectorLen; stride > 0; stride--) {
-    if (n % stride == 0) {
-      eliminatesRemainder = true;
-      if (stride == cacheLineStride) {
-        cacheAligned = true;
-      }
-      return stride;
-    }
-  }
-  
-  // Priority 3: Cache-aligned stride even if it doesn't eliminate remainder
-  if (cacheLineStride > 0 && cacheLineStride <= vectorLen) {
-    cacheAligned = true;
-    return cacheLineStride;
-  }
-  
-  // Priority 4: Max hardware size
-  return vectorLen;
-}
 
 // Find optimal stride for unrolling
 int64_t findOptimalUnrollingStride(int64_t remainder, int64_t vectorLen) {
@@ -299,16 +288,19 @@ int64_t estimateMaskedRemainderInstructions(int64_t m, int64_t n, int64_t k, int
 }
 
 // Strategy function g(f(input)) - decides the best strategy
-// Now with instruction count estimation to choose optimal stride
+// This now uses a very simple, explicit cost model to choose between
+// unrolling the remainder vs masking it:
+//   cost = M * a + N * b
+// where:
+//   - M is the number of masking events (for our remainder, M = 1 if we mask it)
+//   - N is the number of scalar elements handled by unrolling the remainder
+//   - a and b are ISA-specific constants (chosen per AVX/AVX2/AVX-512/SVE)
 StrategyDecision determineStrategy(
     int64_t n, int64_t vectorLen, Type elementType,
     bool hasMaskingCapability, bool hasStaticDims,
     int64_t m = 0, int64_t k = 0) {
   
   StrategyDecision decision;
-  InputWeights weights;
-  CostEvaluation cost = evaluateCost(n, vectorLen, elementType, hasMaskingCapability, hasStaticDims);
-  
   int64_t remainder = n % vectorLen;
   bool hasRemainder = (remainder != 0);
   
@@ -333,56 +325,22 @@ StrategyDecision determineStrategy(
     return decision;
   }
   
-  // Simplified heuristic based on AVX/AVX2/AVX-512 benchmark results:
-  // 1. If perfectly tiled (no remainder): Use NO_MASKING (already handled above)
-  // 2. For AVX (128 bits): If remainder == 1, use UNROLL_REMAINDER
-  // 3. For AVX2 (256 bits) and AVX-512 (512 bits): If remainder <= 3, use UNROLL_REMAINDER
-  // 4. Otherwise: Use MASK_REMAINDER (masking wins for larger remainders)
-  // Note: MASK_BODY is disabled in heuristic for now (code kept for future use)
-  
-  // Check if we should use unrolling based on remainder size and ISA
-  bool shouldUnroll = false;
-  if (remainder == 1) {
-    // Remainder 1: Unrolling performs better for AVX, AVX2, and AVX-512
-    shouldUnroll = true;
-  } else if (remainder <= 3 && vectorWidthOpt >= 256) {
-    // For AVX2 and AVX-512, unrolling wins for remainders 1-3
-    shouldUnroll = true;
-  }
-  
-  if (shouldUnroll) {
-    // Unrolling performs better for small remainders
-    decision.strategy = StrategyDecision::UNROLL_REMAINDER;
-    decision.stride = findOptimalUnrollingStride(remainder, vectorLen);
-    decision.useStride = (decision.stride > 1);
-    decision.cacheAligned = false;
-    decision.eliminatesRemainder = false;
-    
-    if (debugStrategyOpt) {
-      if (vectorWidthOpt >= 512) {
-        llvm::errs() << "[Strategy Debug] Selected: UNROLL_REMAINDER (remainder=" << remainder 
-                     << " <= 3, AVX-512 unrolling wins)\n";
-      } else if (vectorWidthOpt >= 256) {
-        llvm::errs() << "[Strategy Debug] Selected: UNROLL_REMAINDER (remainder=" << remainder 
-                     << " <= 3, AVX2 unrolling wins)\n";
-      } else {
-        llvm::errs() << "[Strategy Debug] Selected: UNROLL_REMAINDER (remainder=1, AVX unrolling wins)\n";
-      }
-    }
-  } else if (hasMaskingCapability) {
-    // Remainder > 1: Masking performs better
-    decision.strategy = StrategyDecision::MASK_REMAINDER;
-    decision.stride = vectorLen; // Use full vector for main loop
-    decision.useStride = false;
-    decision.cacheAligned = false;
-    decision.eliminatesRemainder = false;
-    
-    if (debugStrategyOpt) {
-      llvm::errs() << "[Strategy Debug] Selected: MASK_REMAINDER (remainder=" << remainder 
-                   << ", masking wins)\n";
-    }
-  } else {
-    // Masking not available, use unrolling
+  // Simple cost model: compare masking vs unrolling for the remainder.
+  //
+  // For the remainder region we have two candidates:
+  //   - Masked remainder:
+  //       M_mask = 1  (one masking region / predicate setup)
+  //       N_mask = 0  (no scalar unrolled elements)
+  //       cost_mask = 1 * a
+  //   - Unrolled remainder:
+  //       M_unroll = 0
+  //       N_unroll = remainder  (each leftover column handled scalar)
+  //       cost_unroll = remainder * b
+  //
+  // On ISAs without masking support we force unrolling regardless of the cost.
+
+  // If we cannot use masking at all, fall back to unrolling.
+  if (!hasMaskingCapability) {
     decision.strategy = StrategyDecision::UNROLL_REMAINDER;
     decision.stride = findOptimalUnrollingStride(remainder, vectorLen);
     decision.useStride = (decision.stride > 1);
@@ -392,8 +350,80 @@ StrategyDecision determineStrategy(
     if (debugStrategyOpt) {
       llvm::errs() << "[Strategy Debug] Selected: UNROLL_REMAINDER (masking not available)\n";
     }
+    return decision;
   }
-  
+
+  // Choose (a, b) based on ISA:
+  //   AVX (128):   a=0.25, b=0.10
+  //   AVX2 (256):  a=1.00, b=0.25
+  //   AVX-512:     a=0.25, b=0.10
+  //   SVE (ARM):   a=0.25, b=0.50
+  double a = 1.0;
+  double b = 0.25;
+
+#if defined(__aarch64__)
+  // ARM build: assume SVE/SME configuration.
+  (void)vectorLen;
+  a = 0.25;
+  b = 0.50;
+#else
+  // x86 build: distinguish AVX / AVX2 / AVX-512 via vector width.
+  if (vectorWidthOpt >= 512) {
+    // AVX-512
+    a = 0.25;
+    b = 0.10;
+  } else if (vectorWidthOpt >= 256) {
+    // AVX2
+    a = 1.0;
+    b = 0.25;
+  } else {
+    // AVX (128)
+    a = 0.25;
+    b = 0.10;
+  }
+#endif
+
+  double M_mask = 1.0;
+  double N_mask = 0.0;
+  double costMask = M_mask * a + N_mask * b;
+
+  double M_unroll = 0.0;
+  double N_unroll = static_cast<double>(remainder);
+  double costUnroll = M_unroll * a + N_unroll * b;
+
+  // Decide based purely on the cost model.
+  bool chooseUnroll = (costUnroll < costMask);
+
+  if (debugStrategyOpt) {
+    llvm::errs() << "[Strategy Debug] Remainder heuristic: remainder=" << remainder
+                 << ", mask_cost=" << costMask
+                 << ", unroll_cost=" << costUnroll
+                 << " (a=" << a
+                 << ", b=" << b << ")\n";
+  }
+
+  if (chooseUnroll) {
+    decision.strategy = StrategyDecision::UNROLL_REMAINDER;
+    decision.stride = findOptimalUnrollingStride(remainder, vectorLen);
+    decision.useStride = (decision.stride > 1);
+    decision.cacheAligned = false;
+    decision.eliminatesRemainder = false;
+
+    if (debugStrategyOpt) {
+      llvm::errs() << "[Strategy Debug] Selected: UNROLL_REMAINDER (cost_unroll < cost_mask)\n";
+    }
+  } else {
+    decision.strategy = StrategyDecision::MASK_REMAINDER;
+    decision.stride = vectorLen; // Use full vector for main loop
+    decision.useStride = false;
+    decision.cacheAligned = false;
+    decision.eliminatesRemainder = false;
+
+    if (debugStrategyOpt) {
+      llvm::errs() << "[Strategy Debug] Selected: MASK_REMAINDER (cost_mask <= cost_unroll)\n";
+    }
+  }
+
   return decision;
 }
 
@@ -449,24 +479,41 @@ struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
     Type elementType = lhsType.getElementType();
     int64_t vectorLen = getVectorLength(elementType, vectorWidthOpt);
 
-    // Create vector type
-    VectorType vectorType = VectorType::get({vectorLen}, elementType);
-
     // Get dimension sizes
     int64_t m = resultType.getDimSize(0);
     int64_t n = resultType.getDimSize(1);
     int64_t kDim = lhsType.getDimSize(1);
+    
+    // Apply cache blocking to determine optimal vector logical size
+    int64_t effectiveVectorLen = vectorLen;
+    if (useCacheBlockingOpt && m > 0 && n > 0 && kDim > 0) {
+      CacheInfo cacheInfo = getCacheInfo();
+      effectiveVectorLen = getCacheBlockedVectorSize(m, n, kDim, elementType, vectorLen, cacheInfo);
+      
+      if (debugStrategyOpt) {
+        llvm::errs() << "[Cache Blocking] Hardware vectorLen=" << vectorLen 
+                     << ", cache-blocked vectorLen=" << effectiveVectorLen << "\n";
+        llvm::errs() << "[Cache Blocking] Matrix size: " << m << "x" << n 
+                     << ", K=" << kDim << "\n";
+      }
+    }
+
+    // Create vector type (use effective vector length)
+    VectorType vectorType = VectorType::get({effectiveVectorLen}, elementType);
 
     // Check if dimensions are static and if there's a remainder at compile time
     bool hasStaticDims =
         !resultType.isDynamicDim(0) && !resultType.isDynamicDim(1);
-    bool hasRemainderAtCompileTime = hasStaticDims && (n % vectorLen != 0);
+    bool hasRemainderAtCompileTime = hasStaticDims && (n % effectiveVectorLen != 0);
     
     // Determine strategy: use heuristic if enabled, otherwise use explicit flags
     StrategyDecision strategy;
     // AVX-512 has better masking, but AVX/AVX2 also support some masking
     // For heuristic, we allow masking for all vector widths
     bool hasMaskingCapability = (vectorWidthOpt >= 128); // AVX and above support masking
+    
+    // Use effectiveVectorLen for strategy determination (cache-blocked if enabled)
+    int64_t strategyVectorLen = effectiveVectorLen;
     
     if (useModelStrategyOpt) {
       // Use neural network model for strategy selection
@@ -495,12 +542,12 @@ struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
       }
       
       // Track best configuration details
-      int64_t best_LS = vectorLen;
+      int64_t best_LS = strategyVectorLen;
       int64_t best_remainder_strategy = 0;
       
       // Generate all possible configurations
-      for (int64_t LS = 1; LS <= vectorLen; ++LS) {
-        int64_t LS_equals_VS = (LS == vectorLen) ? 1 : 0;
+      for (int64_t LS = 1; LS <= strategyVectorLen; ++LS) {
+        int64_t LS_equals_VS = (LS == strategyVectorLen) ? 1 : 0;
         int64_t K_remainder = K % LS;  // Numeric remainder, not binary
         int64_t LS_div_K = (K > 0) ? (LS / K) : 0;  // LS // K
         
@@ -526,16 +573,16 @@ struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
             
             // Map to StrategyDecision
             // LS = Logical Size (masking stride for body)
-            // VS = Vector Size (vectorLen)
+            // VS = Vector Size (strategyVectorLen)
             // When LS < VS: Body is masked with stride LS, remainder still needs handling
             // remainder_strategy: 0=masking, 1=unrolling for the remainder part
-            if (K_remainder == 0 && LS == vectorLen) {
+            if (K_remainder == 0 && LS == strategyVectorLen) {
               // Perfect alignment (K % LS == 0) and using full vector width - no masking needed
               best_strategy.strategy = StrategyDecision::NO_MASKING;
-              best_strategy.stride = vectorLen;
+              best_strategy.stride = strategyVectorLen;
               best_strategy.useStride = false;
               best_strategy.eliminatesRemainder = true;
-            } else if (LS < vectorLen) {
+            } else if (LS < strategyVectorLen) {
               // LS < VS: Body is masked with stride LS (MASK_BODY)
               // Remainder handling depends on remainder_strategy:
               // - remainder_strategy=0: mask the remainder too (fully masked)
@@ -546,16 +593,16 @@ struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
               best_strategy.eliminatesRemainder = (K % LS == 0);
               // Store remainder strategy info: we'll use MASK_BODY and handle remainder
               // The remainder_strategy is already captured in best_remainder_strategy
-            } else if (LS == vectorLen && remainder_strategy == 0) {
+            } else if (LS == strategyVectorLen && remainder_strategy == 0) {
               // LS == VS with masking means mask only the remainder - this is MASK_REMAINDER
               best_strategy.strategy = StrategyDecision::MASK_REMAINDER;
-              best_strategy.stride = vectorLen;
+              best_strategy.stride = strategyVectorLen;
               best_strategy.useStride = false;
               best_strategy.eliminatesRemainder = false;
             } else {
               // LS == VS with unrolling: unroll the remainder
               best_strategy.strategy = StrategyDecision::UNROLL_REMAINDER;
-              best_strategy.stride = vectorLen;
+              best_strategy.stride = strategyVectorLen;
               best_strategy.useStride = false;
               best_strategy.eliminatesRemainder = false;
             }
@@ -588,7 +635,7 @@ struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
         const char* remainder_strategy_name = (best_remainder_strategy == 0) ? "masking" : "unrolling";
         llvm::errs() << "[Model Strategy] Selected: " << strategy_name;
         
-        if (best_LS < vectorLen) {
+        if (best_LS < strategyVectorLen) {
           // LS < VS: Body is masked with stride LS, remainder handled separately
           llvm::errs() << " (body_masked=true, body_stride=LS=" << best_LS
                        << ", remainder=" << remainder_strategy_name << ")";
@@ -603,7 +650,7 @@ struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
       // Inputs: alignment/vector size, ISA masking capability, cache line size
       // Pass m and k dimensions for accurate instruction counting
       strategy = determineStrategy(
-          n, vectorLen, elementType, hasMaskingCapability, hasStaticDims, m, kDim);
+          n, strategyVectorLen, elementType, hasMaskingCapability, hasStaticDims, m, kDim);
     } else {
       // Use explicit flags (backward compatibility / blind strategies)
       strategy = StrategyDecision();
@@ -633,7 +680,7 @@ struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
     auto zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
     auto one = rewriter.create<arith::ConstantIndexOp>(loc, 1);
     auto vectorLenConst =
-        rewriter.create<arith::ConstantIndexOp>(loc, vectorLen);
+        rewriter.create<arith::ConstantIndexOp>(loc, effectiveVectorLen);
     auto mConst = rewriter.create<arith::ConstantIndexOp>(loc, m);
     auto nConst = rewriter.create<arith::ConstantIndexOp>(loc, n);
     auto kConst = rewriter.create<arith::ConstantIndexOp>(loc, kDim);
