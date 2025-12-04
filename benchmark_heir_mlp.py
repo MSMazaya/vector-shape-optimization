@@ -204,29 +204,12 @@ def compile_vectorized_block(
             if strategy_name:
                 chosen_strategies.append(strategy_name)
         
-        # If we still didn't find any strategies but stderr exists, show a sample for debugging
-        if not chosen_strategies and strategy_type == "model" and result.stderr:
-            # Look for any lines that might contain strategy info
-            debug_lines = [l.strip() for l in result.stderr.splitlines() 
-                          if any(kw in l.upper() for kw in ["STRATEGY", "MASK", "UNROLL", "SELECT", "MODEL", "CHOOSE"])]
-            if debug_lines:
-                # Show first few relevant lines for debugging
-                sample = "\n      ".join(debug_lines[:5])
-                print(f"    Debug: Could not parse strategies, but found relevant stderr lines:")
-                print(f"      {sample[:400]}")
-            else:
-                # Show a sample of all stderr if no relevant lines found
-                all_lines = [l.strip() for l in result.stderr.splitlines() if l.strip()][:5]
-                if all_lines:
-                    sample = "\n      ".join(all_lines)
-                    print(f"    Debug: No strategy keywords found. Sample stderr (first 5 non-empty lines):")
-                    print(f"      {sample[:400]}")
+        # If we still didn't find any strategies, silently continue
+        # (Debug output removed for cleaner submission)
 
     if result.returncode != 0:
         error_msg = result.stderr[:500] if result.stderr else "Unknown error"
-        print(f"    vector-shape-opt error ({strategy_type}): {error_msg}")
-        if result.stdout:
-            print(f"    stdout: {result.stdout[:200]}")
+        print(f"    Error: {error_msg}")
         return None, chosen_strategies
 
     with open(vectorized_mlir, "w") as f:
@@ -1133,9 +1116,6 @@ def main() -> int:
                     print(f"  Chosen internal strategy: {chosen_strategies[0]}")
                 else:
                     print(f"  Chosen internal strategies ({len(chosen_strategies)} matmuls): {', '.join(chosen_strategies)}")
-            elif strategy in ("heuristic", "model"):
-                # If we expected a strategy but didn't get one, show a hint
-                print(f"  Note: Could not extract internal strategy choice (check if --linalg-to-vector-debug-strategy is enabled)")
             print()
 
 

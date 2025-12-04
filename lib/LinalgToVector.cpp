@@ -61,11 +61,6 @@ static llvm::cl::opt<bool> useCacheLineStrideOpt(
     llvm::cl::desc("Use cache line size (64 bytes) as stride heuristic for body masking"),
     llvm::cl::init(false));
 
-// Cache blocking option
-static llvm::cl::opt<bool> useCacheBlockingOpt(
-    "linalg-to-vector-use-cache-blocking",
-    llvm::cl::desc("Use cache blocking to determine optimal vector logical size based on cache hierarchy"),
-    llvm::cl::init(false));
 
 // Heuristic-based strategy selection
 static llvm::cl::opt<bool> useHeuristicStrategyOpt(
@@ -103,105 +98,6 @@ int64_t getCacheLineStride(Type elementType, int64_t vectorLen) {
   return std::min(cacheLineStride, vectorLen);
 }
 
-// Cache hierarchy information (detected from system)
-struct CacheInfo {
-  int64_t l1dSizeBytes;    // L1 data cache size
-  int64_t l2SizeBytes;     // L2 cache size
-  int64_t l3SizeBytes;     // L3 cache size
-  int64_t cacheLineBytes;  // Cache line size
-  
-  CacheInfo() {
-    // Default values based on typical x86-64 systems
-    // These can be overridden by system detection
-    l1dSizeBytes = 32768;      // 32 KB
-    l2SizeBytes = 2097152;      // 2 MB
-    l3SizeBytes = 12582912;     // 12 MB
-    cacheLineBytes = 64;
-  }
-};
-
-// Get cache information (can be extended to detect from system)
-CacheInfo getCacheInfo() {
-  CacheInfo info;
-  // TODO: Could detect from /sys/devices/system/cpu/cpu0/cache/ or cpuid
-  // For now, use defaults based on typical systems
-  return info;
-}
-
-// Calculate optimal vector logical size based on cache blocking
-// For matrix multiplication C = A * B, we need to consider:
-// - Working set: A block (m_block x k), B block (k x n_block), C block (m_block x n_block)
-// - Goal: Keep working set in L1 cache for best performance
-// - Vector logical size should align with cache blocking strategy
-int64_t getCacheBlockedVectorSize(int64_t m, int64_t n, int64_t k, Type elementType, 
-                                   int64_t vectorLen, CacheInfo& cacheInfo) {
-  unsigned bitWidth = elementType.getIntOrFloatBitWidth();
-  unsigned byteWidth = bitWidth / 8;
-  
-  // Target: Keep working set in L1 cache
-  // Conservative estimate: use 75% of L1 cache to leave room for other data
-  int64_t l1dAvailable = (cacheInfo.l1dSizeBytes * 3) / 4;
-  
-  // For matrix multiplication, we process columns of B and rows of A
-  // Working set per iteration:
-  // - A: m_block * k elements (scalar broadcast, so only k elements loaded)
-  // - B: k * n_block elements (vectorized, so k * n_block elements)
-  // - C: m_block * n_block elements (accumulator)
-  // Total: k + k*n_block + m_block*n_block elements
-  
-  // For cache blocking, we want to choose n_block (vector logical size) such that:
-  // k + k*n_block + m_block*n_block <= l1dAvailable / element_size
-  // Simplifying: assume m_block = 1 (process one row at a time)
-  // Then: k + k*n_block + n_block <= l1dAvailable / element_size
-  // Rearranging: n_block * (k + 1) <= (l1dAvailable / element_size) - k
-  // n_block <= ((l1dAvailable / element_size) - k) / (k + 1)
-  
-  int64_t elementsInL1 = l1dAvailable / byteWidth;
-  
-  // Calculate maximum n_block that fits in L1
-  // Conservative: assume we need space for A (k), B (k * n_block), and C (n_block)
-  int64_t maxNBlock = 0;
-  if (k > 0 && k < elementsInL1) {
-    int64_t availableForBNC = elementsInL1 - k;
-    if (availableForBNC > 0) {
-      // n_block * (k + 1) <= availableForBNC
-      maxNBlock = availableForBNC / (k + 1);
-    }
-  }
-  
-  // Also consider cache line alignment
-  int64_t cacheLineStride = getCacheLineStride(elementType, vectorLen);
-  
-  // Choose optimal vector size:
-  // 1. Should fit in L1 cache (maxNBlock)
-  // 2. Should be <= hardware vector width (vectorLen)
-  // 3. Should align with cache lines when possible
-  // 4. Should be a divisor of n when possible
-  
-  int64_t optimalSize = vectorLen; // Default to hardware max
-  
-  // Try to find a size that fits cache constraints
-  for (int64_t candidate = std::min(maxNBlock, vectorLen); candidate > 0; candidate--) {
-    // Prefer sizes that:
-    // - Are cache line aligned
-    // - Divide n evenly
-    bool cacheAligned = (candidate == cacheLineStride || candidate % cacheLineStride == 0);
-    bool dividesN = (n % candidate == 0);
-    
-    if (cacheAligned || dividesN) {
-      optimalSize = candidate;
-      break;
-    }
-  }
-  
-  // If no good candidate found, use cache line stride if it fits
-  if (optimalSize == vectorLen && cacheLineStride <= maxNBlock && cacheLineStride <= vectorLen) {
-    optimalSize = cacheLineStride;
-  }
-  
-  // Ensure we don't exceed hardware vector width
-  return std::min(optimalSize, vectorLen);
-}
 
 // Strategy decision structure
 struct StrategyDecision {
@@ -237,55 +133,6 @@ int64_t findOptimalUnrollingStride(int64_t remainder, int64_t vectorLen) {
   return 1; // Fallback to unroll one at a time
 }
 
-// Estimate instruction count for fully masked body with stride
-// This estimates the number of instructions that will be generated
-int64_t estimateMaskedBodyInstructions(int64_t m, int64_t n, int64_t k, int64_t stride) {
-  // Outer loop: m iterations
-  // Inner j loop: n/stride iterations (if stride divides n)
-  // Per j iteration:
-  //   - Mask creation: ~1 instruction
-  //   - K loop: k iterations
-  //     Per k iteration:
-  //       - Scalar load from A: ~1 instruction
-  //       - Broadcast: ~1 instruction
-  //       - Masked load from B: ~1 instruction
-  //       - FMA: ~1 instruction
-  //       - Yield: ~1 instruction
-  //   - Masked store: ~1 instruction
-  // Total per j iteration: 1 (mask) + k * 5 (k-loop body) + 1 (store) = 2 + 5*k
-  int64_t jIterations = n / stride; // stride divides n, so this is exact
-  return m * jIterations * (2 + 5 * k);
-}
-
-// Estimate instruction count for masked remainder approach
-int64_t estimateMaskedRemainderInstructions(int64_t m, int64_t n, int64_t k, int64_t vectorLen) {
-  int64_t remainder = n % vectorLen;
-  int64_t fullVectorIterations = n / vectorLen;
-  
-  // Main vectorized loop: m * fullVectorIterations iterations
-  // Per iteration:
-  //   - K loop: k iterations
-  //     Per k iteration:
-  //       - Scalar load: ~1
-  //       - Broadcast: ~1
-  //       - Vector load: ~1
-  //       - FMA: ~1
-  //       - Yield: ~1
-  //   - Vector store: ~1
-  // Total per main iteration: k * 5 + 1 = 5*k + 1
-  
-  // Remainder handling: m iterations
-  // Per remainder iteration:
-  //   - Mask creation: ~1
-  //   - K loop: k iterations (same as above)
-  //   - Masked store: ~1
-  // Total per remainder iteration: 1 + 5*k + 1 = 2 + 5*k
-  
-  int64_t mainLoopInstrs = m * fullVectorIterations * (5 * k + 1);
-  int64_t remainderInstrs = (remainder > 0) ? m * (2 + 5 * k) : 0;
-  
-  return mainLoopInstrs + remainderInstrs;
-}
 
 // Strategy function g(f(input)) - decides the best strategy
 // This now uses a very simple, explicit cost model to choose between
@@ -483,28 +330,14 @@ struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
     int64_t m = resultType.getDimSize(0);
     int64_t n = resultType.getDimSize(1);
     int64_t kDim = lhsType.getDimSize(1);
-    
-    // Apply cache blocking to determine optimal vector logical size
-    int64_t effectiveVectorLen = vectorLen;
-    if (useCacheBlockingOpt && m > 0 && n > 0 && kDim > 0) {
-      CacheInfo cacheInfo = getCacheInfo();
-      effectiveVectorLen = getCacheBlockedVectorSize(m, n, kDim, elementType, vectorLen, cacheInfo);
-      
-      if (debugStrategyOpt) {
-        llvm::errs() << "[Cache Blocking] Hardware vectorLen=" << vectorLen 
-                     << ", cache-blocked vectorLen=" << effectiveVectorLen << "\n";
-        llvm::errs() << "[Cache Blocking] Matrix size: " << m << "x" << n 
-                     << ", K=" << kDim << "\n";
-      }
-    }
 
-    // Create vector type (use effective vector length)
-    VectorType vectorType = VectorType::get({effectiveVectorLen}, elementType);
+    // Create vector type
+    VectorType vectorType = VectorType::get({vectorLen}, elementType);
 
     // Check if dimensions are static and if there's a remainder at compile time
     bool hasStaticDims =
         !resultType.isDynamicDim(0) && !resultType.isDynamicDim(1);
-    bool hasRemainderAtCompileTime = hasStaticDims && (n % effectiveVectorLen != 0);
+    bool hasRemainderAtCompileTime = hasStaticDims && (n % vectorLen != 0);
     
     // Determine strategy: use heuristic if enabled, otherwise use explicit flags
     StrategyDecision strategy;
@@ -512,8 +345,8 @@ struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
     // For heuristic, we allow masking for all vector widths
     bool hasMaskingCapability = (vectorWidthOpt >= 128); // AVX and above support masking
     
-    // Use effectiveVectorLen for strategy determination (cache-blocked if enabled)
-    int64_t strategyVectorLen = effectiveVectorLen;
+    // Use vectorLen for strategy determination
+    int64_t strategyVectorLen = vectorLen;
     
     if (useModelStrategyOpt) {
       // Use neural network model for strategy selection
@@ -680,7 +513,7 @@ struct MatmulToVectorPattern : public OpRewritePattern<linalg::MatmulOp> {
     auto zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
     auto one = rewriter.create<arith::ConstantIndexOp>(loc, 1);
     auto vectorLenConst =
-        rewriter.create<arith::ConstantIndexOp>(loc, effectiveVectorLen);
+        rewriter.create<arith::ConstantIndexOp>(loc, vectorLen);
     auto mConst = rewriter.create<arith::ConstantIndexOp>(loc, m);
     auto nConst = rewriter.create<arith::ConstantIndexOp>(loc, n);
     auto kConst = rewriter.create<arith::ConstantIndexOp>(loc, kDim);

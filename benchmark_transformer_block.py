@@ -209,32 +209,12 @@ def compile_vectorized_block(
             if strategy_name:
                 chosen_strategies.append(strategy_name)
 
-        # If we still didn't find any strategies but stderr exists, show a sample for debugging
-        if not chosen_strategies and strategy_type == "model" and result.stderr:
-            # Look for any lines that might contain strategy info
-            debug_lines = [l.strip() for l in result.stderr.splitlines()
-                           if any(kw in l.upper() for kw in ["STRATEGY", "MASK", "UNROLL", "SELECT", "MODEL", "CHOOSE"])]
-            if debug_lines:
-                # Show first few relevant lines for debugging
-                sample = "\n      ".join(debug_lines[:5])
-                print(
-                    f"    Debug: Could not parse strategies, but found relevant stderr lines:")
-                print(f"      {sample[:400]}")
-            else:
-                # Show a sample of all stderr if no relevant lines found
-                all_lines = [l.strip()
-                             for l in result.stderr.splitlines() if l.strip()][:5]
-                if all_lines:
-                    sample = "\n      ".join(all_lines)
-                    print(
-                        f"    Debug: No strategy keywords found. Sample stderr (first 5 non-empty lines):")
-                    print(f"      {sample[:400]}")
+        # If we still didn't find any strategies, silently continue
+        # (Debug output removed for cleaner submission)
 
     if result.returncode != 0:
         error_msg = result.stderr[:500] if result.stderr else "Unknown error"
-        print(f"    vector-shape-opt error ({strategy_type}): {error_msg}")
-        if result.stdout:
-            print(f"    stdout: {result.stdout[:200]}")
+        print(f"    Error: {error_msg}")
         return None, chosen_strategies
 
     with open(vectorized_mlir, "w") as f:
@@ -785,9 +765,6 @@ def compile_and_benchmark_strategy(
             output = result.stdout + result.stderr
             match = re.search(r"Speedup:\s+([0-9]*\.[0-9]+)x", output)
             if not match:
-                print(
-                    f"    Could not parse speedup for {strategy_type}, output was:\n{output[:400]}"
-                )
                 return None, chosen_strategy
             speedups.append(float(match.group(1)))
 
@@ -836,7 +813,11 @@ def load_machine_config():
 
 
 def cross_compile_and_benchmark_remote(test_file: str, vector_isa: str, machine_config: dict) -> Tuple[Dict[str, Dict[str, Optional[float]]], Dict[str, Optional[list[str]]]]:
-    """Cross-compile locally and run benchmarks on remote machine (ARM or AVX512)."""
+    """Cross-compile (or compile) locally and run benchmarks on remote machine.
+
+    - For ARM SVE: cross-compile to aarch64 and run on ARM.
+    - For x86 AVX/AVX2/AVX-512: compile x86-64 binaries locally and ship them.
+    """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     llvm_path = os.environ.get(
         "LLVM_PROJECT_PATH",
@@ -849,27 +830,44 @@ def cross_compile_and_benchmark_remote(test_file: str, vector_isa: str, machine_
 
     # Set compilation flags based on ISA
     if vector_isa == "sve":
+        # ARM SVE
         llc_attrs = "-mattr=+sve"
         vector_width_flag = "--linalg-to-vector-vector-width=256"
         llc_march = "aarch64"
         clang_flags = "-march=armv8-a+sve"
         cross_compile = True
         target_triple = "aarch64-linux-gnu"
+        target_name = "ARM"
     elif vector_isa == "avx512":
-        llc_attrs = "-mattr=+avx512f"
+        # x86 AVX-512
+        llc_attrs = "-mattr=+avx512f,+avx512vl"
         vector_width_flag = "--linalg-to-vector-vector-width=512"
         llc_march = "x86-64"
         clang_flags = "-march=skylake-avx512"
-        cross_compile = False  # x86-64 to x86-64, no cross-compilation needed
+        cross_compile = False
         target_triple = None
+        target_name = "AVX512"
+    elif vector_isa == "avx2":
+        # x86 AVX2
+        llc_attrs = "-mattr=+avx2,+fma"
+        vector_width_flag = "--linalg-to-vector-vector-width=256"
+        llc_march = "x86-64"
+        clang_flags = "-mavx2 -mfma"
+        cross_compile = False
+        target_triple = None
+        target_name = "AVX2"
     else:
-        # For other ISAs, use old method
-        return run_benchmark_remote_old(test_file, vector_isa, machine_config)
+        # Default x86 AVX (128-bit)
+        llc_attrs = "-mattr=+avx,+fma"
+        vector_width_flag = "--linalg-to-vector-vector-width=128"
+        llc_march = "x86-64"
+        clang_flags = "-mavx -mfma"
+        cross_compile = False
+        target_triple = None
+        target_name = "AVX"
 
     test_file_abs = os.path.abspath(test_file)
     test_file_name = os.path.basename(test_file)
-
-    target_name = "ARM" if vector_isa in ["sve", "sme"] else "AVX512"
     print(f"  Cross-compiling {test_file_name} locally for {target_name}...")
 
     c_type = "float"
@@ -1067,7 +1065,7 @@ def cross_compile_and_benchmark_remote(test_file: str, vector_isa: str, machine_
                 "-o",
                 scalar_o,
             ]
-            # Add attrs for AVX512 (x86-64), but not for ARM cross-compilation
+            # Add ISA attrs for x86 builds, but not for ARM cross-compilation.
             if not cross_compile:
                 llc_cmd.insert(2, llc_attrs)
             subprocess.run(
@@ -1086,23 +1084,20 @@ def cross_compile_and_benchmark_remote(test_file: str, vector_isa: str, machine_
                 # Cross-compile for ARM
                 try:
                     subprocess.run(
-                        ["aarch64-linux-gnu-gcc", "-O3",
-                            "-c", wrapper_c, "-o", wrapper_o],
+                        ["aarch64-linux-gnu-gcc", "-O3", "-c", wrapper_c, "-o", wrapper_o],
                         check=True,
                         capture_output=True,
                     )
                 except (subprocess.CalledProcessError, FileNotFoundError):
                     subprocess.run(
-                        ["clang", f"--target={target_triple}",
-                            "-O3", "-c", wrapper_c, "-o", wrapper_o],
+                        ["clang", f"--target={target_triple}", "-O3", "-c", wrapper_c, "-o", wrapper_o],
                         check=True,
                         capture_output=True,
                     )
             else:
-                # Compile for x86-64 (same architecture)
+                # Compile for x86-64 with appropriate ISA flags
                 subprocess.run(
-                    ["clang", "-O3", clang_flags,
-                        "-c", wrapper_c, "-o", wrapper_o],
+                    ["clang", "-O3"] + clang_flags.split() + ["-c", wrapper_c, "-o", wrapper_o],
                     check=True,
                     capture_output=True,
                 )
@@ -1393,13 +1388,10 @@ def main() -> int:
 
     # Run benchmarks locally or remotely
     if machine_config["type"] == "remote":
-        # Use cross-compilation for ARM targets (SVE/SME) and AVX512
-        if vector_isa in ["sve", "sme", "avx512"]:
-            results, chosen_debug = cross_compile_and_benchmark_remote(
-                test_file, vector_isa, machine_config)
-        else:
-            results, chosen_debug = run_benchmark_remote_old(
-                test_file, vector_isa, machine_config)
+        # For any remote target (AVX, AVX2, AVX-512, SVE), always compile on the
+        # host and ship binaries to the remote machine.
+        results, chosen_debug = cross_compile_and_benchmark_remote(
+            test_file, vector_isa, machine_config)
     else:
         num_runs = 10
         llvm_path = machine_config.get("llvm_project_path", None)
@@ -1423,10 +1415,6 @@ def main() -> int:
                 else:
                     print(
                         f"  Chosen internal strategies ({len(chosen_strategies)} matmuls): {', '.join(chosen_strategies)}")
-            elif strategy in ("heuristic", "model"):
-                # If we expected a strategy but didn't get one, show a hint
-                print(
-                    f"  Note: Could not extract internal strategy choice (check if --linalg-to-vector-debug-strategy is enabled)")
             print()
 
     # Print summary table.
